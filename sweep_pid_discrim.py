@@ -2296,9 +2296,9 @@ def train():
         
         # Get input dimensions from first batch
         sample_batch = next(iter(train_loader))
-        x1_dim = sample_batch[0].size(1)
-        x2_dim = sample_batch[1].size(1)
-        
+        x1_dim = sample_batch[0].size(-1)  # Get last dimension for feature size
+        x2_dim = sample_batch[1].size(-1)  # Get last dimension for feature size
+
         print(f"\nData dimensions:")
         print(f"x1_dim: {x1_dim}")
         print(f"x2_dim: {x2_dim}")
@@ -2389,6 +2389,12 @@ def train():
                         x2 = x2.to(device, non_blocking=True)
                         target = target.to(device, non_blocking=True)
                     
+                    # Ensure tensors have correct shape
+                    if x1.dim() == 3:
+                        x1 = x1.squeeze(1)
+                    if x2.dim() == 3:
+                        x2 = x2.squeeze(1)
+                    
                     opt.zero_grad()
                     
                     # Forward pass with autocast
@@ -2432,6 +2438,12 @@ def train():
                             x1 = x1.to(device, non_blocking=True)
                             x2 = x2.to(device, non_blocking=True)
                             target = target.to(device, non_blocking=True)
+                        
+                        # Ensure tensors have correct shape
+                        if x1.dim() == 3:
+                            x1 = x1.squeeze(1)
+                        if x2.dim() == 3:
+                            x2 = x2.squeeze(1)
                         
                         if prefix == 'discrim_domain1':
                             out = model(x1)
@@ -2674,17 +2686,22 @@ def get_dataset_and_loader(
     print(f"[DEBUG] t_features: {type(t_features)}, shape: {t_features.shape if hasattr(t_features, 'shape') else 'no shape'}")
     print(f"[DEBUG] labels: {type(labels)}, shape: {labels.shape if hasattr(labels, 'shape') else 'no shape'}")
     
-    # Ensure tensors have correct shape
+    # For visual features, if we have a 3D tensor [batch, mean/var, features], take only the mean component
     if v_features.dim() == 3:
-        v_features = v_features.squeeze(1)
+        print("[DEBUG] Visual features have 3 dimensions - taking mean component (index 0)")
+        v_features = v_features[:, 0, :]  # Take mean component
+    
+    # For text features, if we have a 3D tensor, take the first component
     if t_features.dim() == 3:
-        t_features = t_features.squeeze(1)
+        print("[DEBUG] Text features have 3 dimensions - taking first component")
+        t_features = t_features[:, 0, :]
     
     # Ensure labels are in the correct format
     if labels.dim() == 2:  # If we have probability distributions
         print("[DEBUG] Converting probability distributions to class indices")
         labels = labels.argmax(dim=1)
     elif labels.dim() == 3:
+        print("[DEBUG] Labels have 3 dimensions - taking first component")
         labels = labels.squeeze(1)
     elif labels.dim() > 3:
         raise ValueError(f"Unexpected label dimension: {labels.dim()}")
@@ -2717,6 +2734,8 @@ def get_dataset_and_loader(
     # Verify loader output shapes
     sample_batch = next(iter(loader))
     print(f"[DEBUG] Successfully created loader, batch shapes: {[x.shape for x in sample_batch]}")
+    
+    # Create new loader since we consumed one batch
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
