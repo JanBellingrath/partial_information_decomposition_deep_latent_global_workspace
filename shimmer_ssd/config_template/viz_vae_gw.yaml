@@ -1,5 +1,0 @@
-visualization:
-    explore_gw:
-        # wandb_name: zdufxid0
-        checkpoint: shimmer-simple-shapes-zdufxid0/epoch=203.ckpt
-        domain: v_latents

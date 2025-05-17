@@ -1,2 +1,0 @@
-global_workspace:
-    checkpoint: "#{default_root_dir}/shimmer-simple-shapes-t3p8nyq8/epoch=204.ckpt"
