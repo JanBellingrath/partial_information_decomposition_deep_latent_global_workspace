@@ -168,24 +168,19 @@ class CEAlignment(nn.Module):
 
         couplings = []
         for c in range(self.num_labels):
-            mass1 = p_y_x1[:, c].sum() + 1e-8
-            mass2 = p_y_x2[:, c].sum() + 1e-8
-            target = 0.5 * (mass1 + mass2)
-            p_y_x1_c = p_y_x1[:, c] * (target / mass1)
-            p_y_x2_c = p_y_x2[:, c] * (target / mass2)
-            
-            # sinkhorn_probs has its own AMP settings
+            # PAPER'S APPROACH: Use separate marginals directly as per Algorithm 1
+            # Row marginal = p(y=c | x1), Column marginal = p(y=c | x2)
             coupling_c = sinkhorn_probs(
                 A[..., c],
-                p_y_x1_c,
-                p_y_x2_c,
+                p_y_x1[:, c],  # row-marginal = p(y=c | x1) - no averaging
+                p_y_x2[:, c],  # col-marginal = p(y=c | x2) - no averaging
                 # Potentially pass chunk_size from this model if needed by sinkhorn
                 # chunk_size = self.chunk_size # If CEAlignment had self.chunk_size
             )
             couplings.append(coupling_c)
         
         P = torch.stack(couplings, dim=-1)
-        P = P / (P.sum() + 1e-8) # Normalize P across all batch, batch, labels
+        # P = P / (P.sum() + 1e-8) # Normalize P across all batch, batch, labels - REMOVED to preserve exact marginal constraints from Sinkhorn
         return P
 
 class CEAlignmentInformation(nn.Module):

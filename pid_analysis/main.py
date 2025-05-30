@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Dict, List, Any, Optional
 
 import torch
+import numpy as np
 
 # Add the parent directory to the path for imports
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -38,7 +39,7 @@ try:
     HAS_WANDB = True
 except ImportError:
     HAS_WANDB = False
-    print("Warning: wandb not installed. Run 'pip install wandb' to enable experiment tracking.")
+    print("⚠️  Warning: wandb not installed. Run 'pip install wandb' to enable experiment tracking.")
 
 
 def load_synthetic_labels(labels_path: str) -> torch.Tensor:
@@ -52,10 +53,11 @@ def load_synthetic_labels(labels_path: str) -> torch.Tensor:
         Tensor containing the synthetic labels
     """
     if not os.path.exists(labels_path):
-        raise FileNotFoundError(f"Synthetic labels file not found: {labels_path}")
+        raise FileNotFoundError(f"❌ Synthetic labels file not found: {labels_path}")
     
     labels = torch.load(labels_path, map_location='cpu')
-    print(f"Loaded synthetic labels from {labels_path}, shape: {labels.shape}")
+    print(f"📊 Loaded synthetic labels from {labels_path}")
+    print(f"   └── Shape: {labels.shape}")
     return labels
 
 
@@ -216,15 +218,16 @@ def main():
     
     # Synthetic data arguments
     synthetic_parser.add_argument("--functions", nargs="+", 
-                                choices=['and', 'xor', 'id_a', 'id_b', 'or', 'nand', 'nor'],
+                                choices=['and', 'or', 'xor', 'nand', 'nor', 'xnor', 
+                                        'id_a', 'id_b', 'not_a', 'not_b',
+                                        'imp_a_b', 'imp_b_a', 'nimp_a_b', 'nimp_b_a',
+                                        'const_0', 'const_1'],
                                 default=['and', 'xor', 'id_a'],
-                                help="Boolean functions to analyze")
+                                help="Boolean functions to analyze (all 16 Boolean functions available)")
     synthetic_parser.add_argument("--source-a", type=str, default="input_a",
                                 help="Source domain A name")
     synthetic_parser.add_argument("--source-b", type=str, default="input_b", 
                                 help="Source domain B name")
-    synthetic_parser.add_argument("--target", type=str, required=True,
-                                help="Target function name")
     synthetic_parser.add_argument("--output-dir", type=str, required=True,
                                 help="Output directory for results")
     synthetic_parser.add_argument("--n-samples", type=int, default=10000,
@@ -276,108 +279,203 @@ def main():
     args = parser.parse_args()
     
     if args.command == "synthetic":
-        print(f"🧪 Analyzing synthetic Boolean functions: {args.functions}")
-        print(f"📊 Target function: {args.target}")
+        print("\n" + "="*60)
+        print("🧪 PID ANALYSIS - SYNTHETIC BOOLEAN FUNCTIONS")
+        print("="*60)
+        print(f"🔧 Analyzing Functions: {', '.join(args.functions)}")
+        print(f"📊 Samples: {args.n_samples:,}")
+        print(f"🎯 Output Directory: {args.output_dir}")
+        print("="*60 + "\n")
         
         # Create synthetic data interface with noise
         from pid_analysis.data_interface import SyntheticDataProvider, GeneralizedDataInterface
-        provider = SyntheticDataProvider(
-            functions=args.functions,
-            seed=args.seed,
-            theoretical_pid=True
-        )
-        data_interface = GeneralizedDataInterface(provider)
+        from pid_analysis.synthetic_data import get_theoretical_pid_values
         
-        # Set up source and target configurations for Boolean analysis
+        # Set up source configuration for Boolean analysis
         source_config = {"domain_a": "input_a", "domain_b": "input_b"}
-        target_config = args.target
         
-        print(f"🔧 Source config: {source_config}")
-        print(f"🎯 Target config: {target_config}")
+        print(f"🔧 Configuration:")
+        print(f"   ├── Source: {source_config}")
+        print(f"   └── Analyzing {len(args.functions)} functions sequentially\n")
         
-        # Run analysis with data interface
-        result = analyze_with_data_interface(
-            data_interface=data_interface,
-            source_config=source_config,
-            target_config=target_config,
-            output_dir=args.output_dir,
-            n_samples=args.n_samples,
-            batch_size=args.batch_size,
-            num_clusters=args.num_clusters,
-            discrim_epochs=args.discrim_epochs,
-            ce_epochs=args.ce_epochs,
-            discrim_hidden_dim=args.discrim_hidden_dim,
-            discrim_layers=args.discrim_layers,
-            # Pass provider-specific kwargs
-            add_noise=True,
-            noise_std=0.1
-        )
+        # Store results for all functions
+        all_results = {}
+        theoretical_values = get_theoretical_pid_values() if args.compare_theoretical else {}
         
-        # Compare with theoretical values if requested
-        if args.compare_theoretical:
-            from pid_analysis.synthetic_data import get_theoretical_pid_values
-            theoretical = get_theoretical_pid_values()
+        # Analyze each function sequentially
+        for i, function_name in enumerate(args.functions, 1):
+            print(f"🔍 [{i}/{len(args.functions)}] ANALYZING: {function_name.upper()}")
+            print("─" * 40)
             
-            if args.target in theoretical:
-                print(f"\n📊 Comparison for {args.target}:")
-                print("=" * 50)
+            try:
+                # Create provider for this specific function
+                provider = SyntheticDataProvider(
+                    functions=[function_name],  # Only include the current function
+                    seed=args.seed,
+                    theoretical_pid=True
+                )
+                data_interface = GeneralizedDataInterface(provider)
                 
-                # The PID results are returned as a list [redundant, unique_1, unique_2, synergistic]
+                print(f"🚀 Starting analysis for {function_name}...")
+                
+                # Run analysis with data interface
+                result = analyze_with_data_interface(
+                    data_interface=data_interface,
+                    source_config=source_config,
+                    target_config=function_name,  # Use current function as target
+                    output_dir=f"{args.output_dir}/{function_name}",
+                    n_samples=args.n_samples,
+                    batch_size=args.batch_size,
+                    num_clusters=args.num_clusters,
+                    discrim_epochs=args.discrim_epochs,
+                    ce_epochs=args.ce_epochs,
+                    discrim_hidden_dim=args.discrim_hidden_dim,
+                    discrim_layers=args.discrim_layers,
+                    # Pass provider-specific kwargs
+                    add_noise=True,
+                    noise_std=0.1
+                )
+                
+                # Parse PID results
                 pid_results = result['pid_results']
-                
-                # Handle different return formats from critic_ce_alignment
                 pid_values = None
+                
                 if isinstance(pid_results, tuple) and len(pid_results) > 0:
-                    # If it's a tuple, first element should be the tensor with PID values
-                    if hasattr(pid_results[0], 'tolist'):  # It's a tensor
+                    if hasattr(pid_results[0], 'tolist'):
                         pid_values = pid_results[0].tolist()
                     elif isinstance(pid_results[0], list):
                         pid_values = pid_results[0]
                 elif isinstance(pid_results, list) and len(pid_results) > 0:
-                    # Handle nested list structure - extract the actual PID values
                     if isinstance(pid_results[0], list) and len(pid_results[0]) >= 4:
                         pid_values = pid_results[0]
-                    # If it's directly a list of numbers, use that
                     elif len(pid_results) >= 4 and all(isinstance(x, (int, float)) for x in pid_results[:4]):
                         pid_values = pid_results
-                elif hasattr(pid_results, 'tolist'):  # Direct tensor
+                elif hasattr(pid_results, 'tolist'):
                     pid_values = pid_results.tolist()
                 
                 if pid_values and len(pid_values) >= 4:
-                    measured_redundant = pid_values[0]
-                    measured_unique_a = pid_values[1] 
-                    measured_unique_b = pid_values[2]
-                    measured_synergistic = pid_values[3]
+                    all_results[function_name] = {
+                        'redundant': pid_values[0],
+                        'unique_a': pid_values[1],
+                        'unique_b': pid_values[2],
+                        'synergistic': pid_values[3]
+                    }
                     
-                    theo_values = theoretical[args.target]
+                    print(f"✅ {function_name}: R={pid_values[0]:.3f}, UA={pid_values[1]:.3f}, UB={pid_values[2]:.3f}, S={pid_values[3]:.3f}")
+                else:
+                    print(f"❌ Failed to parse results for {function_name}")
+                    all_results[function_name] = {
+                        'redundant': float('nan'),
+                        'unique_a': float('nan'),
+                        'unique_b': float('nan'),
+                        'synergistic': float('nan')
+                    }
+                
+            except Exception as e:
+                print(f"❌ Error analyzing {function_name}: {str(e)}")
+                all_results[function_name] = {
+                    'redundant': float('nan'),
+                    'unique_a': float('nan'),
+                    'unique_b': float('nan'),
+                    'synergistic': float('nan')
+                }
+            
+            print("─" * 40 + "\n")
+        
+        # Create comprehensive comparison table
+        if args.compare_theoretical and theoretical_values:
+            print("\n" + "="*80)
+            print("📊 COMPREHENSIVE THEORETICAL COMPARISON")
+            print("="*80)
+            print("Function       │ Component   │ Measured │ Expected │ Difference │ Status")
+            print("───────────────┼─────────────┼──────────┼──────────┼────────────┼────────")
+            
+            # Sort functions for consistent output
+            sorted_functions = sorted([f for f in args.functions if f in all_results])
+            
+            for function_name in sorted_functions:
+                if function_name in theoretical_values and function_name in all_results:
+                    measured = all_results[function_name]
+                    expected = theoretical_values[function_name]
                     
-                    comparisons = [
-                        ('redundant', measured_redundant, theo_values['redundant']),
-                        ('unique_a', measured_unique_a, theo_values['unique_a']),
-                        ('unique_b', measured_unique_b, theo_values['unique_b']),
-                        ('synergistic', measured_synergistic, theo_values['synergistic'])
+                    components = [
+                        ('🔄 Redundant', 'redundant'),
+                        ('🅰️  Unique A', 'unique_a'),
+                        ('🅱️  Unique B', 'unique_b'),
+                        ('⚡ Synergistic', 'synergistic')
                     ]
                     
-                    for comp_name, measured, expected in comparisons:
-                        diff = abs(measured - expected)
-                        print(f"{comp_name:12}: measured={measured:.3f}, expected={expected:.3f}, diff={diff:.3f}")
-                else:
-                    print("Could not parse PID results for comparison")
-                    print(f"Debug: pid_results type={type(pid_results)}")
-                    if hasattr(pid_results, '__len__') and len(pid_results) > 0:
-                        print(f"First element type: {type(pid_results[0])}")
-                        if hasattr(pid_results[0], 'shape'):
-                            print(f"First element shape: {pid_results[0].shape}")
-                        elif hasattr(pid_results[0], '__len__'):
-                            print(f"First element length: {len(pid_results[0])}")
-            else:
-                print(f"No theoretical values available for {args.target}")
+                    for i, (comp_display, comp_key) in enumerate(components):
+                        m_val = measured[comp_key]
+                        e_val = expected[comp_key]
+                        
+                        if not (isinstance(m_val, float) and np.isnan(m_val)):
+                            diff = abs(m_val - e_val)
+                            status = "✅" if diff < 0.1 else "⚠️" if diff < 0.2 else "❌"
+                            
+                            if i == 0:  # First row for this function
+                                func_display = f"{function_name:<14}"
+                            else:
+                                func_display = " " * 14
+                            
+                            print(f"{func_display} │ {comp_display:<11} │  {m_val:6.3f}  │  {e_val:6.3f}  │   {diff:7.3f}  │  {status}")
+                        else:
+                            if i == 0:  # First row for this function
+                                func_display = f"{function_name:<14}"
+                            else:
+                                func_display = " " * 14
+                            print(f"{func_display} │ {comp_display:<11} │    NaN   │  {e_val:6.3f}  │     ---    │  ❌")
+                    
+                    # Add separator between functions
+                    if function_name != sorted_functions[-1]:
+                        print("───────────────┼─────────────┼──────────┼──────────┼────────────┼────────")
         
-        print(f"✅ Synthetic analysis complete! Results saved to: {args.output_dir}")
+        # Summary statistics
+        if all_results:
+            print(f"\n📈 SUMMARY STATISTICS")
+            print("="*40)
+            
+            valid_results = {k: v for k, v in all_results.items() 
+                           if not any(isinstance(val, float) and np.isnan(val) for val in v.values())}
+            
+            if valid_results:
+                print(f"✅ Successfully analyzed: {len(valid_results)}/{len(args.functions)} functions")
+                
+                # Calculate average absolute errors if theoretical values available
+                if args.compare_theoretical and theoretical_values:
+                    total_errors = []
+                    for func_name, measured in valid_results.items():
+                        if func_name in theoretical_values:
+                            expected = theoretical_values[func_name]
+                            for comp in ['redundant', 'unique_a', 'unique_b', 'synergistic']:
+                                total_errors.append(abs(measured[comp] - expected[comp]))
+                    
+                    if total_errors:
+                        avg_error = np.mean(total_errors)
+                        max_error = np.max(total_errors)
+                        print(f"📊 Average absolute error: {avg_error:.3f}")
+                        print(f"📊 Maximum absolute error: {max_error:.3f}")
+                        print(f"🎯 Functions with error < 0.1: {sum(1 for e in total_errors if e < 0.1)}/{len(total_errors)} components")
+            else:
+                print(f"❌ No valid results obtained")
+            
+            print(f"📁 Individual results saved to: {args.output_dir}/[function_name]/")
+        
+        print(f"\n✅ COMPREHENSIVE ANALYSIS COMPLETE!")
+        print("="*60 + "\n")
         
     elif args.command == "file":
         # Handle file-based data analysis
-        print(f"📁 Analyzing data from files in: {args.data_dir}")
+        print("\n" + "="*60)
+        print("📁 PID ANALYSIS - FILE-BASED DATA")
+        print("="*60)
+        print(f"📂 Data Directory: {args.data_dir}")
+        print(f"🏷️  Domain Names: {', '.join(args.domain_names)}")
+        print(f"📄 File Pattern: {args.file_pattern}")
+        print(f"🎯 Output Directory: {args.output_dir}")
+        print("="*60 + "\n")
+        
+        print("🔧 Creating data interface...")
         
         # Create file data interface
         data_interface = create_data_interface(
@@ -386,6 +484,8 @@ def main():
             domain_names=args.domain_names,
             file_pattern=args.file_pattern
         )
+        
+        print("🚀 Starting analysis...")
         
         # Run analysis
         result = analyze_with_data_interface(
@@ -398,9 +498,15 @@ def main():
             # ... other arguments ...
         )
         
-        print(f"✅ File-based analysis complete! Results saved to: {args.output_dir}")
+        print(f"\n✅ FILE-BASED ANALYSIS COMPLETE!")
+        print(f"📁 Results saved to: {args.output_dir}")
+        print("="*60 + "\n")
         
     elif args.command == "model":
+        print("\n" + "="*60)
+        print("🤖 PID ANALYSIS - MODEL-BASED")
+        print("="*60)
+        
         # Set global configuration variables
         if args.use_amp:
             import pid_analysis.utils as pid_utils
@@ -421,18 +527,18 @@ def main():
         else:
             device = args.device
         
-        print(f"Using device: {device}")
+        print(f"💻 Device: {device}")
         
         # Set GPU memory fraction if specified
         if torch.cuda.is_available() and args.gpu_memory_fraction is not None:
             if 0.0 < args.gpu_memory_fraction <= 1.0:
                 try:
                     torch.cuda.set_per_process_memory_fraction(args.gpu_memory_fraction)
-                    print(f"Set GPU memory fraction to {args.gpu_memory_fraction}")
+                    print(f"🎛️  GPU Memory Fraction: {args.gpu_memory_fraction}")
                 except Exception as e:
-                    print(f"Warning: Could not set GPU memory fraction: {e}")
+                    print(f"⚠️  Warning: Could not set GPU memory fraction: {e}")
             else:
-                print(f"Warning: Invalid GPU memory fraction {args.gpu_memory_fraction}")
+                print(f"⚠️  Warning: Invalid GPU memory fraction {args.gpu_memory_fraction}")
         
         # Load synthetic labels
         synthetic_labels = load_synthetic_labels(args.synthetic_labels)
@@ -446,27 +552,37 @@ def main():
         source_config = parse_json_or_file(args.source_config)
         
         # Load domain modules
-        print("Loading domain modules...")
+        print("🔧 Loading domain modules...")
         domain_modules = load_domain_modules(domain_configs, eval_mode=True, device=device)
-        print(f"Loaded domain modules: {list(domain_modules.keys())}")
+        print(f"✅ Loaded domain modules: {', '.join(list(domain_modules.keys()))}")
         
         # Set up data module if requested
         data_module = None
         if args.use_dataset and args.dataset_path:
-            print(f"Setting up dataset from {args.dataset_path}")
+            print(f"📚 Setting up dataset from {args.dataset_path}")
             # This would need to be implemented based on the specific dataset format
             # For now, we'll leave it as None
-            print("Warning: Dataset loading not implemented yet. Using model-generated data.")
+            print("⚠️  Warning: Dataset loading not implemented yet. Using model-generated data.")
         
         # Create output directory
         os.makedirs(args.output_dir, exist_ok=True)
+        print(f"📁 Output directory: {args.output_dir}")
+        print("="*60 + "\n")
         
         # Run analysis based on mode
         if args.single_model:
             if not args.model_path:
-                parser.error("--model-path is required when using --single-model")
+                parser.error("❌ --model-path is required when using --single-model")
             
-            print(f"Analyzing single model: {args.model_path}")
+            print("🔍 SINGLE MODEL ANALYSIS")
+            print("─"*30)
+            print(f"📍 Model Path: {args.model_path}")
+            print(f"🎯 Target Config: {args.target_config}")
+            print(f"📊 Samples: {args.n_samples:,}")
+            print("─"*30 + "\n")
+            
+            print("🚀 Starting single model analysis...")
+            
             result = analyze_model(
                 model_path=args.model_path,
                 domain_modules=domain_modules,
@@ -497,14 +613,24 @@ def main():
                 enable_extended_metrics_discrim=not args.disable_extended_metrics
             )
             
-            print(f"Analysis complete. Results saved to {args.output_dir}")
-            print(f"PID values: {result['pid_results']}")
+            print(f"\n✅ SINGLE MODEL ANALYSIS COMPLETE!")
+            print(f"📁 Results saved to: {args.output_dir}")
+            print(f"📊 PID Values: {result['pid_results']}")
+            print("="*60 + "\n")
         
         elif args.multiple_models:
             if not args.checkpoint_dir:
-                parser.error("--checkpoint-dir is required when using --multiple-models")
+                parser.error("❌ --checkpoint-dir is required when using --multiple-models")
             
-            print(f"Analyzing multiple models from: {args.checkpoint_dir}")
+            print("🔍 MULTIPLE MODELS ANALYSIS")
+            print("─"*35)
+            print(f"📂 Checkpoint Directory: {args.checkpoint_dir}")
+            print(f"🎯 Target Config: {args.target_config}")
+            print(f"📊 Samples per Model: {args.n_samples:,}")
+            print("─"*35 + "\n")
+            
+            print("🚀 Starting multiple models analysis...")
+            
             results = analyze_multiple_models(
                 checkpoint_dir=args.checkpoint_dir,
                 domain_modules=domain_modules,
@@ -535,17 +661,27 @@ def main():
                 enable_extended_metrics_discrim=not args.disable_extended_metrics
             )
             
-            print(f"Analysis complete. Analyzed {len(results)} models.")
-            print(f"Results saved to {args.output_dir}")
+            print(f"\n✅ MULTIPLE MODELS ANALYSIS COMPLETE!")
+            print(f"📊 Analyzed {len(results)} models")
+            print(f"📁 Results saved to: {args.output_dir}")
+            print("="*60 + "\n")
         
         elif args.model_list:
             if not args.checkpoint_list:
-                parser.error("--checkpoint-list is required when using --model-list")
+                parser.error("❌ --checkpoint-list is required when using --model-list")
             
             # Create matching domain configs for each checkpoint
             domain_configs_list = domain_configs * len(args.checkpoint_list)
             
-            print(f"Analyzing {len(args.checkpoint_list)} models from list")
+            print("🔍 MODEL LIST ANALYSIS")
+            print("─"*30)
+            print(f"📝 Number of Models: {len(args.checkpoint_list)}")
+            print(f"🎯 Target Config: {args.target_config}")
+            print(f"📊 Samples per Model: {args.n_samples:,}")
+            print("─"*30 + "\n")
+            
+            print("🚀 Starting model list analysis...")
+            
             results = analyze_multiple_models_from_list(
                 checkpoint_list=args.checkpoint_list,
                 domain_configs=domain_configs_list,
@@ -568,19 +704,31 @@ def main():
                 use_compile=args.use_compile
             )
             
-            print(f"Analysis complete. Analyzed {len(results)} models.")
-            print(f"Results saved to {args.output_dir}")
+            print(f"\n✅ MODEL LIST ANALYSIS COMPLETE!")
+            print(f"📊 Analyzed {len(results)} models")
+            print(f"📁 Results saved to: {args.output_dir}")
+            print("="*60 + "\n")
         
         elif args.find_latest:
-            print(f"Finding latest checkpoint in: {args.base_dir}")
+            print("🔍 LATEST CHECKPOINT ANALYSIS")
+            print("─"*35)
+            print(f"📂 Base Directory: {args.base_dir}")
+            print("─"*35 + "\n")
+            
+            print("🔎 Finding latest checkpoint...")
             checkpoint_list = find_latest_model_checkpoints(args.base_dir)
             
             if not checkpoint_list:
-                print("No latest checkpoint found.")
+                print("❌ No latest checkpoint found.")
+                print("="*60 + "\n")
                 return
             
             checkpoint_path = checkpoint_list[0]
-            print(f"Found latest checkpoint: {checkpoint_path}")
+            print(f"✅ Found latest checkpoint: {checkpoint_path}")
+            print(f"🎯 Target Config: {args.target_config}")
+            print(f"📊 Samples: {args.n_samples:,}\n")
+            
+            print("🚀 Starting analysis...")
             
             result = analyze_model(
                 model_path=checkpoint_path,
@@ -612,8 +760,10 @@ def main():
                 enable_extended_metrics_discrim=not args.disable_extended_metrics
             )
             
-            print(f"Analysis complete. Results saved to {args.output_dir}")
-            print(f"PID values: {result['pid_results']}")
+            print(f"\n✅ LATEST CHECKPOINT ANALYSIS COMPLETE!")
+            print(f"📁 Results saved to: {args.output_dir}")
+            print(f"📊 PID Values: {result['pid_results']}")
+            print("="*60 + "\n")
     else:
         parser.print_help()
 
