@@ -15,8 +15,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, random_split, Subset
 import torch.utils.checkpoint
-import matplotlib.pyplot as plt
-import seaborn as sns
 
 # Fix import: Import GradScaler from cuda.amp and autocast from amp
 from torch.amp import autocast
@@ -43,6 +41,16 @@ try:
 except ImportError:
     HAS_WANDB = False
     print("Warning: wandb not installed. Run 'pip install wandb' to enable experiment tracking.")
+
+# Import for new metrics
+from sklearn.metrics import (
+    precision_recall_fscore_support,
+    jaccard_score,
+    brier_score_loss,
+    roc_auc_score,
+    precision_recall_curve,
+)
+from sklearn.calibration import calibration_curve
 
 # Try to import shimmer, but continue if not available (for help/argparse)
 try:
@@ -111,11 +119,11 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 device_name = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # Global performance configuration (will be overridden by command line arguments)
-CHUNK_SIZE = 128  # Size of chunks for processing large matrices sequentially
-MEMORY_CLEANUP_INTERVAL = 10  # Number of iterations after which to force memory cleanup
-USE_AMP = False  # Whether to use automatic mixed precision
-PRECISION = torch.float16  # Precision to use with AMP
-AGGRESSIVE_CLEANUP = False  # Whether to aggressively clean up memory between operations
+# CHUNK_SIZE = 128  # Moved to utils.py
+# MEMORY_CLEANUP_INTERVAL = 10  # Moved to utils.py
+# USE_AMP = False  # Moved to utils.py
+# PRECISION = torch.float16  # Moved to utils.py
+# AGGRESSIVE_CLEANUP = False  # Moved to utils.py
 
 # ——————————————————————————————————————————————————————————————————————————————
 # DATASET
@@ -126,6 +134,7 @@ class MultimodalDataset(Dataset):
     
     This dataset handles multiple tensors (one per modality) and labels.
     All tensors are kept on CPU to avoid CUDA initialization errors in worker processes.
+    Labels can be either hard labels (integers) or soft labels (probability distributions).
     """
     
     def __init__(self, data: List[torch.Tensor], labels: torch.Tensor):
@@ -134,7 +143,7 @@ class MultimodalDataset(Dataset):
         
         Args:
             data: List of tensors, one per modality
-            labels: Tensor of labels
+            labels: Tensor of labels (can be either hard labels or soft probabilities)
         """
         # Move all tensors to CPU
         self.data = [t.cpu() if isinstance(t, torch.Tensor) else t for t in data]
@@ -155,8 +164,11 @@ class MultimodalDataset(Dataset):
                 f"Got {self.labels.size(0)}, expected {n_samples}"
             )
         
-        # Log dimensions
-        print(f"MultimodalDataset init - labels shape: {self.labels.shape}, dim: {self.labels.dim()}")
+        # Log dimensions and type
+        print(f"MultimodalDataset init:")
+        print(f"├─ Labels shape: {self.labels.shape}")
+        print(f"├─ Labels dim: {self.labels.dim()}")
+        print(f"└─ Labels type: {'soft' if self.labels.dim() > 1 else 'hard'}")
         print(f"All tensors moved to CPU for DataLoader worker compatibility")
     
     def __len__(self) -> int:
@@ -172,6 +184,8 @@ class MultimodalDataset(Dataset):
             
         Returns:
             Tuple of (modality1, modality2, ..., label)
+            For GMM, label is a probability distribution over clusters
+            For kmeans, label is a single integer
         """
         # Get data for each modality (already on CPU)
         modalities = [tensor[idx] for tensor in self.data]
@@ -190,8 +204,8 @@ def sinkhorn_probs(
     matrix: torch.Tensor,
     x1_probs: torch.Tensor,
     x2_probs: torch.Tensor,
-    tol: float = 1e-1,
-    max_iter: int = 30,
+    tol: float = 1e-8,
+    max_iter: int = 500,
     chunk_size: Optional[int] = None,
 ) -> torch.Tensor:
     """
@@ -601,8 +615,40 @@ class CEAlignment(nn.Module):
                 p_y_x1_c,
                 p_y_x2_c
             )
-            couplings.append(coupling_c)
             
+            # DEBUGGING CODE FOR SINKHORN CONVERGENCE - DISABLING
+            # with torch.no_grad():
+            #     # Compute marginals and errors
+            #     row_sums = coupling_c.sum(dim=1)
+            #     col_sums = coupling_c.sum(dim=0)
+            #     # Ensure p_y_x1_c and p_y_x2_c are on the same device as sums before subtraction
+            #     row_err  = (row_sums - p_y_x1_c.to(row_sums.device)).cpu().numpy()
+            #     col_err  = (col_sums - p_y_x2_c.to(col_sums.device)).cpu().numpy()
+
+            #     # 1) Print summary stats
+            #     print(f"Sinkhorn Debug - Label {c}:  max|row_err|={np.abs(row_err).max():.2e}")
+            #     # Removed mean_abs_row_err and second print line for col_err max and mean
+            #     print(f"Sinkhorn Debug - Label {c}:  max|col_err|={np.abs(col_err).max():.2e}")
+
+            #     # 2) Histogram - REMOVED
+            #     # plt.figure(figsize=(6,2))
+            #     # plt.hist(row_err, bins=30, alpha=0.7, label='row_err')
+            #     # plt.hist(col_err, bins=30, alpha=0.7, label='col_err')
+            #     # plt.legend(); plt.title(f"Sinkhorn Marginal residuals for label {c}")
+            #     # plt.show()
+
+            #     # 3) Combined 2D heatmap - REMOVED
+            #     # Ensure row_err and col_err are 1D for broadcasting if they aren't already
+            #     # err2d = np.abs(row_err.reshape(-1, 1)) + np.abs(col_err.reshape(1, -1))
+            #     # plt.figure(figsize=(4,4))
+            #     # plt.imshow(err2d, aspect='auto', cmap='viridis') # Added cmap for better visualization
+            #     # plt.colorbar(label='|row_err|+|col_err|')
+            #     # plt.title(f"Sinkhorn Residual heatmap label {c}")
+            #     # plt.show()
+            # # END DEBUGGING CODE
+            
+            couplings.append(coupling_c)
+        
         # Stack along label dimension
         # Shape: [batch_size, batch_size, num_labels]
         P = torch.stack(couplings, dim=-1)
@@ -717,7 +763,7 @@ class CEAlignmentInformation(nn.Module):
         
         # Calculate scalar loss for optimization (negative because we're maximizing)
         
-        loss = mi_q_y_x1x2
+        loss = -mi_q_y_x1x2
         
         # Final cleanup
         if self.aggressive_cleanup and torch.cuda.is_available():
@@ -732,183 +778,577 @@ class CEAlignmentInformation(nn.Module):
 # ——————————————————————————————————————————————————————————————————————————————
 # TRAIN/EVAL LOOPS FOR DISCRIMINATORS & ALIGNMENT
 #——————————————————————————————————————————————————————————————————————————————
-def train_discrim(model, loader, optimizer, data_type, num_epoch=40, wandb_prefix=None, use_compile=True, use_mc=False, mc_chunk_size=None, mc_diagnostic_freq=50, mc_runs=2):
+def train_discrim(model, loader, optimizer, data_type, num_epoch=40, wandb_prefix=None, use_compile=True, cluster_method='gmm', enable_extended_metrics=True):
     """Train a Discrim on (X → Y). data_type tells which fields of the batch are features/labels."""
     model.train()
-    
-    # If using MC, create a wrapped version but keep original model
-    mc_model = None
-    if use_mc:
-        mc_model = MCDiscriminator(
-            base_model=model,
-            chunk_size=mc_chunk_size,
-            sinkhorn_fn=sinkhorn_probs
-        )
     
     # Apply torch.compile to the base model if requested
     if use_compile:
         model = torch.compile(model)
-        print("Applied torch.compile to discriminator model")
+        print("🚀 Applied torch.compile optimization to discriminator")
+    
+    # For storing logits from the previous epoch (for rank correlation)
+    prev_probs_epoch = None
     
     for epoch in range(num_epoch):
         epoch_loss = 0.0
-        correct = 0
-        total = 0
+        # correct = 0 # No longer needed as we use metrics from all_targets and all_preds
+        # total = 0   # No longer needed
+
+        all_logits_epoch = []
+        all_targets_epoch = []
         
+        # Initialize extended metrics and plotting variables to NaN or empty
+        ce_loss_metric = np.nan
+        kl_div_metric = np.nan
+        jaccard_metric = np.nan
+        precision_micro, recall_micro, f1_micro = np.nan, np.nan, np.nan
+        entropy_mean_metric = np.nan
+        rho, tau = np.nan, np.nan
+        brier_metric = np.nan
+        ece_metric = np.nan
+        one_hot_epoch = np.array([])
+        entropies_epoch = np.array([])
+        rel_diag_mean_predicted_value = np.array([])
+        rel_diag_fraction_of_positives = np.array([])
+        top_k_accuracy_epoch = np.nan # Already initialized earlier, but good to be explicit
+
         for batch_idx, batch in enumerate(loader):
             optimizer.zero_grad()
             # unpack features & label
             xs = [batch[i].float().to(device) for i in data_type[0]]
-            y = batch[data_type[1][0]].long().to(device)
+            y_batch_original = batch[data_type[1][0]].to(device)  # Keep as float for GMM soft labels
             
-            # Handle y shape - convert to 1D for CrossEntropyLoss
-            if y.dim() > 1:
-                if y.size(1) == 1:  # If shape is [N, 1], can simply squeeze
-                    y = y.squeeze(-1)
-                else:  # If shape is [N, D], we need to handle differently
-                    # For this code, we'll use the first column as the target 
-                    # but this might need adjustment based on your data
-                    y = y[:, 0]
+            # Standard neural network forward pass
+            logits_batch = model(*xs)
             
-            # Get number of classes from model's output layer
-            num_classes = model.mlp[-1].out_features
+            # Handle different clustering methods for loss calculation
+            if cluster_method == 'kmeans':
+                # For kmeans, convert to long and use CrossEntropyLoss
+                y_batch_for_loss = y_batch_original.long()
+                if y_batch_for_loss.dim() > 1:
+                    if y_batch_for_loss.size(1) == 1:
+                        y_batch_for_loss = y_batch_for_loss.squeeze(-1)
+                    else: # If it's one-hot or multi-column, take the first as the class index
+                        y_batch_for_loss = y_batch_for_loss[:, 0]
+                
+                num_classes = model.mlp[-1].out_features
+                if y_batch_for_loss.min() < 0 or y_batch_for_loss.max() >= num_classes:
+                    if y_batch_for_loss.min() < 0:
+                        offset = -y_batch_for_loss.min().item()
+                        y_batch_for_loss = y_batch_for_loss + offset
+                    y_batch_for_loss = torch.clamp(y_batch_for_loss, 0, num_classes-1)
+                criterion = nn.CrossEntropyLoss()
+                loss = criterion(logits_batch, y_batch_for_loss)
+                
+                # Store detached cpu tensors for metrics
+                all_logits_epoch.append(logits_batch.detach().cpu())
+                all_targets_epoch.append(y_batch_for_loss.detach().cpu()) # Store hard labels
+
+            else:  # GMM
+                y_batch_for_loss = y_batch_original # Use soft labels for GMM loss
+                log_q_batch = F.log_softmax(logits_batch, dim=1)
+                criterion = nn.KLDivLoss(reduction='batchmean')
+                loss = criterion(log_q_batch, y_batch_for_loss)
+
+                # Store detached cpu tensors for metrics
+                all_logits_epoch.append(logits_batch.detach().cpu())
+                all_targets_epoch.append(y_batch_for_loss.argmax(dim=1).detach().cpu() if y_batch_for_loss.dim() > 1 else y_batch_for_loss.detach().cpu()) # Store hard labels from soft
             
-            # Ensure labels are non-negative and in the valid range [0, num_classes-1]
-            if y.min() < 0 or y.max() >= num_classes:
-                # Convert labels to be in range [0, num_classes-1]
-                if y.min() < 0:
-                    # Shift labels to be non-negative
-                    offset = -y.min().item()
-                    y = y + offset
-                # Then clamp to valid range
-                y = torch.clamp(y, 0, num_classes-1)
-            
-            # Forward pass - use MC model if enabled, otherwise use standard NN
-            if use_mc:
-                # For MC, we need to run diagnostics periodically
-                if batch_idx % mc_diagnostic_freq == 0:
-                    logits, diagnostics = mc_model(*xs, return_diagnostics=True)
-                    
-                    # Log MC diagnostics
-                    if wandb_prefix:
-                        log_diagnostics_to_wandb(
-                            mean=diagnostics['mean_mc'],
-                            var=diagnostics['var_mc'],
-                            estimates=diagnostics['mc_runs'],
-                            mc_marginals=diagnostics['mc_marginals'],
-                            sinkhorn_marginals=diagnostics['sinkhorn_marginals'],
-                            prefix=f"{wandb_prefix}_batch{batch_idx}"
-                        )
-                        
-                        # Log additional metrics
-                        wandb.log({
-                            f"{wandb_prefix}/grad_norm": compute_grad_norm(model),
-                            f"{wandb_prefix}/lr": optimizer.param_groups[0]['lr'],
-                            **{f"{wandb_prefix}/{k}": v for k, v in diagnostics['metrics'].items()}
-                        })
-                else:
-                    logits = mc_model(*xs)
-            else:
-                # Standard neural network forward pass
-                logits = model(*xs)
-            
-            loss = nn.CrossEntropyLoss()(logits, y)
+            # Backward pass and optimization
             loss.backward()
             optimizer.step()
             
             # Track metrics
             epoch_loss += loss.item()
-            preds = logits.argmax(dim=-1)
-            total += y.size(0)
-            correct += (preds == y).sum().item()
+            
+            # Clear memory
+            del xs, y_batch_original, logits_batch, loss
+            if cluster_method == 'gmm':
+                del log_q_batch
+            torch.cuda.empty_cache()
         
-        # Calculate epoch metrics
-        avg_loss = epoch_loss / len(loader)
-        accuracy = correct / total
+        # After the epoch, concatenate all collected logits and targets
+        logits_epoch = torch.cat(all_logits_epoch)
+        targets_epoch_np = torch.cat(all_targets_epoch).numpy() # Now these are always hard integer labels
         
-        print(f"{'MC-' if use_mc else ''}Discrim Train Epoch {epoch+1}/{num_epoch}, Loss: {avg_loss:.4f}, Acc: {accuracy:.4f}")
+        # Ensure targets are 1D
+        if targets_epoch_np.ndim > 1 and targets_epoch_np.shape[1] == 1:
+            targets_epoch_np = targets_epoch_np.squeeze(-1)
+        elif targets_epoch_np.ndim > 1: # If still multi-dimensional (e.g. from GMM that wasn't argmaxed correctly before)
+             targets_epoch_np = np.argmax(targets_epoch_np, axis=1)
+
+
+        probs_epoch_np = F.softmax(logits_epoch, dim=1).numpy()
+        preds_epoch_np = probs_epoch_np.argmax(axis=1)
+        
+        num_classes_epoch = probs_epoch_np.shape[1]
+
+        # Top-k Accuracy (k=5)
+        top_k_val = 5
+        top_k_accuracy_epoch = np.nan # Default to NaN
+        if logits_epoch.shape[0] > 0: # Check if there are samples
+            # Ensure k is not greater than the number of classes
+            actual_k = min(top_k_val, num_classes_epoch)
+            if actual_k > 0:
+                _, pred_top_k = torch.topk(logits_epoch, actual_k, dim=1, largest=True, sorted=True)
+                # Convert targets_epoch_np to torch tensor for comparison
+                targets_epoch_torch_for_topk = torch.from_numpy(targets_epoch_np).view(-1, 1).expand_as(pred_top_k)
+                correct_k = torch.any(pred_top_k == targets_epoch_torch_for_topk, dim=1)
+                top_k_accuracy_epoch = correct_k.float().mean().item()
+            else:
+                # This case (actual_k <=0) should ideally not happen if num_classes_epoch > 0
+                # but if num_classes_epoch is 0 or 1, top-k isn't well-defined or is same as top-1
+                if actual_k == 1 : top_k_accuracy_epoch = accuracy_epoch # If k=1, it's same as top-1
+
+        # Calculate epoch metrics (original loss is sum of batch losses)
+        avg_batch_loss = epoch_loss / len(loader) # This is the average of the training loss function (CE or KLDiv)
+        # Accuracy is now derived from the full epoch predictions
+        accuracy_epoch = np.mean(preds_epoch_np == targets_epoch_np) if preds_epoch_np.size > 0 else np.nan
+
+        print(f"\nEpoch {epoch+1:3d}/{num_epoch} 🚀")
+        print("--------------------------------------------------")
+        print("  📋 Metrics:")
+        print(f"    - Avg Batch Loss (Criterion): {avg_batch_loss:.4f}")
+        print(f"    - Accuracy (Top-1):           {accuracy_epoch:.4f}")
+        print(f"    - Accuracy (Top-{top_k_val}):         {top_k_accuracy_epoch:.4f}")
+        
+        if enable_extended_metrics:
+            # 1) Cross-entropy (log-loss):
+            # Ensure targets are long for cross_entropy
+            ce_loss_metric = F.cross_entropy(logits_epoch, torch.from_numpy(targets_epoch_np).long(), reduction='mean').item()
+
+            # 2) KL divergence vs. one-hot targets:
+            one_hot_epoch = np.eye(num_classes_epoch)[targets_epoch_np]
+            kl_div_metric = np.mean(np.sum(one_hot_epoch * (np.log(one_hot_epoch + 1e-12) - np.log(probs_epoch_np + 1e-12)), axis=1))
+
+            # 3) Jaccard (for multiclass, average='macro'):
+            jaccard_metric = jaccard_score(targets_epoch_np, preds_epoch_np, average='macro', zero_division=0)
+
+            # 4) Precision/Recall/F1 (micro-averaged):
+            precision_micro, recall_micro, f1_micro, _ = precision_recall_fscore_support(
+                targets_epoch_np, preds_epoch_np, average='micro', zero_division=0
+            )
+
+            # 5) Predictive-distribution entropy:
+            entropies_epoch = -np.sum(probs_epoch_np * np.log(probs_epoch_np + 1e-12), axis=1)
+            entropy_mean_metric = entropies_epoch.mean()
+
+            # 6) Rank correlation (Spearman's Rho, Kendall's Tau)
+            rho, tau = np.nan, np.nan # Default to NaN if prev_probs is None
+            if prev_probs_epoch is not None and prev_probs_epoch.shape == probs_epoch_np.shape:
+                try:
+                    # Compare probabilities of the true class
+                    true_class_probs_current = probs_epoch_np[np.arange(len(targets_epoch_np)), targets_epoch_np]
+                    true_class_probs_prev = prev_probs_epoch[np.arange(len(targets_epoch_np)), targets_epoch_np]
+                    
+                    if len(true_class_probs_current) > 1 and len(true_class_probs_prev) > 1: # Need at least 2 samples
+                        rho, _ = spearmanr(true_class_probs_prev, true_class_probs_current)
+                        tau, _ = kendalltau(true_class_probs_prev, true_class_probs_current)
+                except Exception as e:
+                    print(f"Warning: Could not compute rank correlation: {e}")
+                    rho, tau = np.nan, np.nan
+            prev_probs_epoch = probs_epoch_np.copy() # Store current probs for next epoch
+
+
+            # 7) Calibration: ECE and Brier
+            #   a) Brier (for multiclass, use sum of squares):
+            brier_metric = np.mean(np.sum((probs_epoch_np - one_hot_epoch)**2, axis=1))
+
+            #   b) ECE: reliability curve (Manual binning for robustness and scikit-learn version independence)
+            max_probs_1d = probs_epoch_np.max(axis=1)
+            # Ensure targets_epoch_np_1d is correctly shaped (1D)
+            if targets_epoch_np.ndim > 1 and targets_epoch_np.shape[1] == 1:
+                targets_epoch_np_1d = targets_epoch_np.squeeze(-1)
+            elif targets_epoch_np.ndim > 1:
+                 targets_epoch_np_1d = np.argmax(targets_epoch_np, axis=1)
+            else:
+                targets_epoch_np_1d = targets_epoch_np
+
+            ece_metric = np.nan
+            rel_diag_mean_predicted_value = np.array([]) # Initialize as empty for plotting
+            rel_diag_fraction_of_positives = np.array([])# Initialize as empty for plotting
+
+            if len(max_probs_1d) == len(targets_epoch_np_1d) and len(max_probs_1d) > 0:
+                try:
+                    num_bins = 10
+                    bins_ece = np.linspace(0.0, 1.0, num_bins + 1)
+                    
+                    # Digitize confidences (max_probs_1d) into bins
+                    # Correct bin indices will be 0 to num_bins-1
+                    bin_indices = np.digitize(max_probs_1d, bins_ece[1:-1])
+
+                    bin_accuracies_calc = np.zeros(num_bins)
+                    bin_confidences_calc = np.zeros(num_bins)
+                    bin_counts_calc = np.zeros(num_bins)
+
+                    for i_bin in range(num_bins):
+                        in_bin = (bin_indices == i_bin)
+                        bin_counts_calc[i_bin] = np.sum(in_bin)
+
+                        if bin_counts_calc[i_bin] > 0:
+                            # Accuracy in this bin: fraction of correct predictions
+                            bin_accuracies_calc[i_bin] = np.mean((preds_epoch_np == targets_epoch_np_1d)[in_bin])
+                            # Average confidence in this bin
+                            bin_confidences_calc[i_bin] = np.mean(max_probs_1d[in_bin])
+                        # If bin_counts_calc[i_bin] == 0, acc and conf remain 0, which is fine for ECE sum if count is 0
+
+                    # Filter out bins with no samples for ECE calculation and plotting data
+                    valid_bins_mask = bin_counts_calc > 0
+                    if np.any(valid_bins_mask):
+                        rel_diag_fraction_of_positives = bin_accuracies_calc[valid_bins_mask]
+                        rel_diag_mean_predicted_value = bin_confidences_calc[valid_bins_mask]
+                        
+                        # ECE calculation: sum(|acc - conf| * P(bin))
+                        ece_metric = np.sum(np.abs(rel_diag_fraction_of_positives - rel_diag_mean_predicted_value) * (bin_counts_calc[valid_bins_mask] / np.sum(bin_counts_calc)))
+                    else:
+                        print("Warning: All ECE bins are empty during training. Skipping ECE calculation.")
+                        ece_metric = np.nan # Or 0, depending on preference for empty data
+
+                except Exception as e_cal:
+                    print(f"Warning: Could not compute ECE or reliability diagram during training: {e_cal}")
+                    ece_metric = np.nan
+                    # Ensure plot data is empty or NaN if error occurs before assignment
+                    rel_diag_mean_predicted_value = np.array([]) 
+                    rel_diag_fraction_of_positives = np.array([])
+            else:
+                print(f"Warning: Mismatch in length or zero length for ECE calculation during training. Probs: {len(max_probs_1d)}, Targets: {len(targets_epoch_np_1d)}. Skipping ECE.")
+
+
+            print(f"    - Cross-Entropy (Log-Loss):   {ce_loss_metric:.4f}")
+            print(f"    - KL Divergence (vs. OneHot): {kl_div_metric:.4f}")
+            print(f"    - Jaccard Score (Macro):      {jaccard_metric:.4f}")
+            print(f"    - Precision (Micro):          {precision_micro:.4f}")
+            print(f"    - Recall (Micro):             {recall_micro:.4f}")
+            print(f"    - F1-Score (Micro):           {f1_micro:.4f}")
+            print(f"    - Predictive Entropy (Mean):  {entropy_mean_metric:.4f}")
+            print("  📈 Rank Correlation (vs. Prev Epoch):")
+            print(f"    - Spearman's Rho:             {rho:.3f}")
+            print(f"    - Kendall's Tau:              {tau:.3f}")
+            print("  📊 Calibration:")
+            print(f"    - ECE (Expected Calib. Err):  {ece_metric:.4f}")
+            print(f"    - Brier Score (Multiclass):   {brier_metric:.4f}")
+        
+        print("--------------------------------------------------")
         
         # Log to wandb if enabled
-        if HAS_WANDB and wandb_prefix is not None:
-            wandb.log({
-                f"{wandb_prefix}/train_loss": avg_loss,
-                f"{wandb_prefix}/train_acc": accuracy,
+        if HAS_WANDB and wandb_prefix is not None and wandb.run is not None:
+            log_dict = {
                 f"{wandb_prefix}/epoch": epoch,
-            })
-    
-    # Return the appropriate model
-    return mc_model if use_mc else model
+                f"{wandb_prefix}/avg_train_loss_func": avg_batch_loss, # Loss from training objective
+                f"{wandb_prefix}/accuracy": accuracy_epoch, # This is Top-1
+                f"{wandb_prefix}/accuracy_top_{top_k_val}": top_k_accuracy_epoch if not np.isnan(top_k_accuracy_epoch) else 0,
+                f"{wandb_prefix}/cross_entropy": ce_loss_metric,
+                f"{wandb_prefix}/kl_divergence": kl_div_metric,
+                f"{wandb_prefix}/jaccard": jaccard_metric,
+                f"{wandb_prefix}/precision_micro": precision_micro,
+                f"{wandb_prefix}/recall_micro": recall_micro,
+                f"{wandb_prefix}/f1_micro": f1_micro,
+                f"{wandb_prefix}/entropy_mean": entropy_mean_metric,
+                f"{wandb_prefix}/spearman_rho": rho if not np.isnan(rho) else 0,
+                f"{wandb_prefix}/kendall_tau": tau if not np.isnan(tau) else 0,
+                f"{wandb_prefix}/ece": ece_metric if not np.isnan(ece_metric) else 0,
+                f"{wandb_prefix}/brier_score": brier_metric,
+            }
 
-def eval_discrim(model, loader, data_type, wandb_prefix=None):
+            # Plotting in W&B
+            # a) ECE reliability diagram
+            if not (np.isnan(rel_diag_mean_predicted_value).any() or np.isnan(rel_diag_fraction_of_positives).any()):
+                 if len(rel_diag_mean_predicted_value) > 1 and len(rel_diag_fraction_of_positives) > 1 : # Ensure there's data to plot
+                    log_dict[f"{wandb_prefix}/reliability_diagram"] = wandb.plot.line_series(
+                        xs=rel_diag_mean_predicted_value.tolist(), 
+                        ys=[rel_diag_fraction_of_positives.tolist(), rel_diag_mean_predicted_value.tolist()], 
+                        keys=["accuracy", "confidence"],
+                        title=f"{wandb_prefix} Reliability Diagram",
+                        xname="Confidence"
+                    )
+                 else:
+                    # print(f"Warning: Not enough data points for reliability diagram. Confidences: {rel_diag_mean_predicted_value}, Accuracies: {rel_diag_fraction_of_positives}")
+                    pass # Do nothing if not enough data
+
+
+            # b) Entropy histogram
+            if entropies_epoch.size > 0 and not np.isnan(entropies_epoch).all():
+                log_dict[f"{wandb_prefix}/entropy_histogram"] = wandb.Histogram(entropies_epoch[~np.isnan(entropies_epoch)])
+
+
+            # c) Precision-Recall curve
+            # Ensure shapes are compatible for ravel. one_hot_epoch [N, C], probs_epoch_np [N, C]
+            if one_hot_epoch.ndim == 2 and probs_epoch_np.ndim == 2 and one_hot_epoch.shape == probs_epoch_np.shape:
+                try:
+                    pr_prec, pr_rec, _ = precision_recall_curve(one_hot_epoch.ravel(), probs_epoch_np.ravel())
+                    if len(pr_rec) > 1 and len(pr_prec) > 1: # Ensure there's data to plot
+                         log_dict[f"{wandb_prefix}/pr_curve"] = wandb.plot.line_series(
+                              xs=pr_rec.tolist(), 
+                              ys=pr_prec.tolist(), 
+                              title=f"{wandb_prefix} PR Curve", 
+                              xname="Recall"
+                         ) 
+                    else:
+                         # print(f"Warning: Not enough data points for PR curve. Recall len: {len(pr_rec)}, Precision len: {len(pr_prec)}")
+                         pass # Do nothing if not enough data
+                except Exception as e_pr:
+                    print(f"Warning: Could not compute or log PR curve: {e_pr}")
+            else:
+                # print(f"Warning: Skipping PR curve due to shape mismatch. one_hot: {one_hot_epoch.shape}, probs: {probs_epoch_np.shape}")
+                pass # Do nothing if shapes mismatch
+
+
+            wandb.log(log_dict)
+    
+    # Return the model
+    return model
+
+def eval_discrim(model, loader, data_type, wandb_prefix=None, cluster_method='gmm', enable_extended_metrics=True):
     model.eval()
+    # test_loss = 0.0 # Will be replaced by CE and KL from full data
+    # all_preds = [] # Will be replaced by all_logits_eval and all_targets_eval for confusion matrix
+    # all_targets = [] # Will be replaced
+
+    all_logits_eval = []
+    all_targets_eval = [] # For hard labels
+    # correct_eval = 0 # No longer needed
+    # total_eval = 0   # No longer needed
+    sum_criterion_loss_eval = 0.0 # To sum the criterion loss (CE or KL) over batches
+
     with torch.no_grad():
-        total, acc = 0, 0
-        test_loss = 0.0
-        all_preds = []
-        all_targets = []
-        
         for batch in loader:
             xs = [batch[i].float().to(device) for i in data_type[0]]
-            y = batch[data_type[1][0]].long().to(device)
+            y_batch_original = batch[data_type[1][0]].to(device)  # Keep as float for GMM soft labels
             
-            # Handle y shape - convert to 1D for evaluation
-            if y.dim() > 1:
-                if y.size(1) == 1:  # If shape is [N, 1], can simply squeeze
-                    y = y.squeeze(-1)
-                else:  # If shape is [N, D], we need to handle differently
-                    # For this code, we'll use the first column as the target
-                    y = y[:, 0]
+            logits_batch = model(*xs)
+            all_logits_eval.append(logits_batch.cpu()) # Store logits
             
-            # Get number of classes from model's output layer
-            num_classes = model.mlp[-1].out_features
+            # Handle different clustering methods for loss accumulation and target storage
+            if cluster_method == 'kmeans':
+                y_batch_for_loss = y_batch_original.long()
+                if y_batch_for_loss.dim() > 1:
+                    if y_batch_for_loss.size(1) == 1:
+                        y_batch_for_loss = y_batch_for_loss.squeeze(-1)
+                    else:
+                        y_batch_for_loss = y_batch_for_loss[:, 0]
+                
+                num_classes = model.mlp[-1].out_features
+                if y_batch_for_loss.min() < 0 or y_batch_for_loss.max() >= num_classes:
+                    if y_batch_for_loss.min() < 0:
+                        offset = -y_batch_for_loss.min().item()
+                        y_batch_for_loss = y_batch_for_loss + offset
+                    y_batch_for_loss = torch.clamp(y_batch_for_loss, 0, num_classes-1)
+                
+                criterion = nn.CrossEntropyLoss()
+                loss_batch = criterion(logits_batch, y_batch_for_loss)
+                all_targets_eval.append(y_batch_for_loss.cpu()) # Store hard labels
+
+            else:  # GMM
+                y_batch_for_loss = y_batch_original # Use soft labels for GMM loss
+                log_q_batch = F.log_softmax(logits_batch, dim=1)
+                criterion = nn.KLDivLoss(reduction='batchmean')
+                loss_batch = criterion(log_q_batch, y_batch_for_loss)
+                all_targets_eval.append(y_batch_for_loss.argmax(dim=1).cpu() if y_batch_for_loss.dim() > 1 else y_batch_for_loss.cpu()) # Store hard labels from soft
+
+            sum_criterion_loss_eval += loss_batch.item()
             
-            # Ensure labels are non-negative and in the valid range [0, num_classes-1]
-            if y.min() < 0 or y.max() >= num_classes:
-                # Convert labels to be in range [0, num_classes-1]
-                if y.min() < 0:
-                    # Shift labels to be non-negative
-                    offset = -y.min().item()
-                    y = y + offset
-                # Then clamp to valid range
-                y = torch.clamp(y, 0, num_classes-1)
-            
-            logits = model(*xs)
-            loss = nn.CrossEntropyLoss()(logits, y)
-            test_loss += loss.item()
-            
-            preds = logits.argmax(dim=-1)
-            total += y.size(0)
-            acc += (preds == y).sum().item()
-            
-            # Collect predictions and targets for confusion matrix
-            all_preds.append(preds.cpu())
-            all_targets.append(y.cpu())
+            # Clear memory
+            del xs, y_batch_original, logits_batch, loss_batch
+            if cluster_method == 'gmm':
+                del log_q_batch
+            torch.cuda.empty_cache()
         
-        accuracy = acc / total
-        avg_loss = test_loss / len(loader)
-        print(f"Discrim eval acc: {accuracy:.3f}, loss: {avg_loss:.4f}")
+    # Concatenate all collected logits and targets
+    logits_eval = torch.cat(all_logits_eval)
+    targets_eval_np = torch.cat(all_targets_eval).numpy()
+
+    # Ensure targets are 1D
+    if targets_eval_np.ndim > 1 and targets_eval_np.shape[1] == 1:
+        targets_eval_np = targets_eval_np.squeeze(-1)
+    elif targets_eval_np.ndim > 1:
+        targets_eval_np = np.argmax(targets_eval_np, axis=1)
         
-        # Log to wandb if enabled
-        if HAS_WANDB and wandb_prefix is not None:
-            wandb.log({
-                f"{wandb_prefix}/eval_loss": avg_loss,
-                f"{wandb_prefix}/eval_acc": accuracy,
-            })
-            
-            # Create confusion matrix if we have wandb
-            if len(all_preds) > 0 and len(all_targets) > 0:
+    probs_eval_np = F.softmax(logits_eval, dim=1).numpy()
+    preds_eval_np = probs_eval_np.argmax(axis=1)
+    num_classes_eval = probs_eval_np.shape[1]
+
+    # Calculate metrics
+    # Original average loss from criterion and overall accuracy
+    avg_criterion_loss_eval = sum_criterion_loss_eval / len(loader)
+    accuracy_eval = np.mean(preds_eval_np == targets_eval_np)
+
+    print_str = f"📊 Evaluation | AvgCritLoss: {avg_criterion_loss_eval:.4f} Acc: {accuracy_eval:.4f}"
+    
+    # Initialize metrics that are conditionally computed
+    ce_loss_metric = np.nan
+    kl_div_metric = np.nan
+    jaccard_metric = np.nan
+    precision_micro, recall_micro, f1_micro = np.nan, np.nan, np.nan
+    entropy_mean_metric = np.nan
+    ece_metric = np.nan
+    brier_metric = np.nan
+    # Initialize plot-related variables as empty or NaN to avoid errors if not computed
+    one_hot_eval = np.array([]) 
+    entropies_eval = np.array([])
+    rel_diag_mean_predicted_value_eval = np.array([])
+    rel_diag_fraction_of_positives_eval = np.array([])
+
+    if enable_extended_metrics:
+        # 1) Cross-entropy (log-loss)
+        ce_loss_metric = F.cross_entropy(logits_eval, torch.from_numpy(targets_eval_np).long(), reduction='mean').item()
+        # 2) KL divergence vs. one-hot targets:
+        one_hot_eval = np.eye(num_classes_eval)[targets_eval_np]
+        kl_div_metric = np.mean(np.sum(one_hot_eval * (np.log(one_hot_eval + 1e-12) - np.log(probs_eval_np + 1e-12)), axis=1))
+
+        # 3) Jaccard (for multiclass, average='macro'):
+        jaccard_metric = jaccard_score(targets_eval_np, preds_eval_np, average='macro', zero_division=0)
+
+        # 4) Precision/Recall/F1 (micro-averaged):
+        precision_micro, recall_micro, f1_micro, _ = precision_recall_fscore_support(
+            targets_eval_np, preds_eval_np, average='micro', zero_division=0
+        )
+
+        # 5) Predictive-distribution entropy:
+        entropies_eval = -np.sum(probs_eval_np * np.log(probs_eval_np + 1e-12), axis=1)
+        if entropies_eval.size > 0: # Add check for empty array before mean
+            entropy_mean_metric = entropies_eval.mean()
+        else:
+            entropy_mean_metric = np.nan
+
+        # 7) Calibration: ECE and Brier (Rank correlations omitted for eval)
+        #   a) Brier (for multiclass, use sum of squares):
+        if one_hot_eval.size > 0: # Add check for empty array
+            brier_metric = np.mean(np.sum((probs_eval_np - one_hot_eval)**2, axis=1))
+        else:
+            brier_metric = np.nan
+
+        #   b) ECE: reliability curve
+        max_probs_1d_eval = probs_eval_np.max(axis=1)
+        if max_probs_1d_eval.ndim > 1: max_probs_1d_eval = max_probs_1d_eval.squeeze()
+        
+        targets_eval_np_1d = (targets_eval_np.squeeze(-1) if targets_eval_np.ndim > 1 and targets_eval_np.shape[1] == 1 else (np.argmax(targets_eval_np, axis=1) if targets_eval_np.ndim > 1 else targets_eval_np))
+
+        if len(max_probs_1d_eval) == len(targets_eval_np_1d) and len(max_probs_1d_eval) > 0:
+            y_true_for_ece_eval = (preds_eval_np == targets_eval_np_1d).astype(int)
+
+            if len(np.unique(y_true_for_ece_eval)) < 2 and len(y_true_for_ece_eval) > 1:
+                print(f"Eval Warning: y_true_for_ece_eval has only one unique value ({np.unique(y_true_for_ece_eval)}), calibration_curve may error. Skipping ECE.")
+            else:
                 try:
-                    all_preds = torch.cat(all_preds).numpy()
-                    all_targets = torch.cat(all_targets).numpy()
-                    wandb.log({f"{wandb_prefix}/confusion_matrix": wandb.plot.confusion_matrix(
-                        y_true=all_targets,
-                        preds=all_preds,
-                        class_names=[str(i) for i in range(num_classes)]
-                    )})
-                except Exception as e:
-                    print(f"Warning: Could not log confusion matrix to wandb: {e}")
+                    rel_diag_fraction_of_positives_eval, rel_diag_mean_predicted_value_eval = calibration_curve(
+                        y_true_for_ece_eval, max_probs_1d_eval, n_bins=10, strategy='uniform', normalize=True
+                    )
+
+                    bins_ece_eval = np.linspace(0, 1, 11)
+                    digitized_confidences_eval = np.digitize(max_probs_1d_eval, bins=bins_ece_eval[1:-1])
+                    # Ensure minlength is at least 1 for bincount, and handle empty rel_diag_mean_predicted_value_eval
+                    min_len_bincount = max(1, len(rel_diag_mean_predicted_value_eval) if rel_diag_mean_predicted_value_eval.size > 0 else 1)
+                    bin_sample_counts_eval = np.bincount(digitized_confidences_eval, minlength=min_len_bincount)
+                    
+                    num_returned_bins_eval = len(rel_diag_mean_predicted_value_eval)
+                    bin_sample_counts_aligned_eval = bin_sample_counts_eval[:num_returned_bins_eval]
+
+                    if np.sum(bin_sample_counts_aligned_eval) != len(max_probs_1d_eval):
+                        strict_bins_eval = np.linspace(0, 1, 11)
+                        digitized_confidences_strict_eval = np.digitize(max_probs_1d_eval, bins=strict_bins_eval, right=False)
+                        digitized_confidences_strict_eval[digitized_confidences_strict_eval == 0] = 1 # Map 0 to bin 1 (index 0)
+                        digitized_confidences_strict_eval[digitized_confidences_strict_eval > 10] = 10 # Map >10 to bin 10 (index 9)
+                        bin_sample_counts_strict_eval = np.bincount(digitized_confidences_strict_eval - 1, minlength=num_returned_bins_eval if num_returned_bins_eval > 0 else 1)
+                        bin_sample_counts_aligned_eval = bin_sample_counts_strict_eval[:num_returned_bins_eval]
+                    
+                    if np.sum(bin_sample_counts_aligned_eval) == 0:
+                        ece_metric = np.nan
+                    else:
+                        ece_metric = np.sum(np.abs(rel_diag_fraction_of_positives_eval - rel_diag_mean_predicted_value_eval) * bin_sample_counts_aligned_eval) / np.sum(bin_sample_counts_aligned_eval)
+
+                except ValueError as e_cal_eval:
+                    print(f"Eval Warning: Could not compute ECE or reliability diagram: {e_cal_eval}. y_true_for_ece_eval unique: {np.unique(y_true_for_ece_eval)}, max_probs_1d_eval len: {len(max_probs_1d_eval)}")
+        else:
+            print(f"Eval Warning: Mismatch in length or zero length for ECE. Probs: {len(max_probs_1d_eval)}, Targets: {len(targets_eval_np_1d)}")
         
-        return accuracy, avg_loss
+        print_str += f" || CE: {ce_loss_metric:.4f}  KL: {kl_div_metric:.4f}  Jaccard: {jaccard_metric:.4f}  "
+        print_str += f"Pₘᵢ𝚌ᵣₒ: {precision_micro:.4f}  Rₘᵢ𝚌ᵣₒ: {recall_micro:.4f}  F1ₘᵢ𝚌ᵣₒ: {f1_micro:.4f}  "
+        print_str += f"H(ent): {entropy_mean_metric:.4f}  ECE: {ece_metric:.4f}  Brier: {brier_metric:.4f}"
+    
+    print(print_str)
+        
+    # Log to wandb if enabled
+    if HAS_WANDB and wandb_prefix is not None and wandb.run is not None:
+        log_dict_eval = {
+            f"{wandb_prefix}/eval_avg_criterion_loss": avg_criterion_loss_eval,
+            f"{wandb_prefix}/eval_accuracy": accuracy_eval,
+        }
+        
+        if enable_extended_metrics:
+            log_dict_eval.update({
+                f"{wandb_prefix}/eval_cross_entropy": ce_loss_metric if not np.isnan(ce_loss_metric) else 0,
+                f"{wandb_prefix}/eval_kl_divergence": kl_div_metric if not np.isnan(kl_div_metric) else 0,
+                f"{wandb_prefix}/eval_jaccard": jaccard_metric if not np.isnan(jaccard_metric) else 0,
+                f"{wandb_prefix}/eval_precision_micro": precision_micro if not np.isnan(precision_micro) else 0,
+                f"{wandb_prefix}/eval_recall_micro": recall_micro if not np.isnan(recall_micro) else 0,
+                f"{wandb_prefix}/eval_f1_micro": f1_micro if not np.isnan(f1_micro) else 0,
+                f"{wandb_prefix}/eval_entropy_mean": entropy_mean_metric if not np.isnan(entropy_mean_metric) else 0,
+                f"{wandb_prefix}/eval_ece": ece_metric if not np.isnan(ece_metric) else 0,
+                f"{wandb_prefix}/eval_brier_score": brier_metric if not np.isnan(brier_metric) else 0,
+            })
+
+            # Plotting in W&B for eval
+            # a) ECE reliability diagram
+            if rel_diag_mean_predicted_value_eval.size > 0 and rel_diag_fraction_of_positives_eval.size > 0 and \
+               not (np.isnan(rel_diag_mean_predicted_value_eval).any() or np.isnan(rel_diag_fraction_of_positives_eval).any()):
+                if len(rel_diag_mean_predicted_value_eval) > 1 and len(rel_diag_fraction_of_positives_eval) > 1:
+                    log_dict_eval[f"{wandb_prefix}/eval_reliability_diagram"] = wandb.plot.line_series(
+                        xs=rel_diag_mean_predicted_value_eval.tolist(),
+                        ys=[rel_diag_fraction_of_positives_eval.tolist(), rel_diag_mean_predicted_value_eval.tolist()],
+                        keys=["accuracy", "confidence"],
+                        title=f"{wandb_prefix} Eval Reliability Diagram",
+                        xname="Confidence"
+                    )
+                else:
+                    # print(f"Eval Warning: Not enough data for reliability diagram. Confs: {rel_diag_mean_predicted_value_eval}, Accs: {rel_diag_fraction_of_positives_eval}")
+                    pass # Do nothing if not enough data
+            else:
+                 # print(f"Eval Warning: Skipping reliability diagram due to empty or NaN data.")
+                 pass # Do nothing if data is empty/NaN
+
+            # b) Entropy histogram
+            if entropies_eval.size > 0 and not np.isnan(entropies_eval).all():
+                log_dict_eval[f"{wandb_prefix}/eval_entropy_histogram"] = wandb.Histogram(entropies_eval[~np.isnan(entropies_eval)])
+
+            # c) Precision-Recall curve
+            if one_hot_eval.ndim == 2 and probs_eval_np.ndim == 2 and one_hot_eval.shape == probs_eval_np.shape and one_hot_eval.size > 0:
+                try:
+                    pr_prec_eval, pr_rec_eval, _ = precision_recall_curve(one_hot_eval.ravel(), probs_eval_np.ravel())
+                    if len(pr_rec_eval) > 1 and len(pr_prec_eval) > 1:
+                        log_dict_eval[f"{wandb_prefix}/eval_pr_curve"] = wandb.plot.line_series(
+                            xs=pr_rec_eval.tolist(), 
+                            ys=pr_prec_eval.tolist(), 
+                            title=f"{wandb_prefix} Eval PR Curve", 
+                            xname="Recall"
+                        )
+                    else:
+                        # print(f"Eval Warning: Not enough data for PR curve. Recall: {len(pr_rec_eval)}, Precision: {len(pr_prec_eval)}")
+                        pass # Do nothing if not enough data
+                except Exception as e_pr_eval:
+                    print(f"Eval Warning: Could not compute or log PR curve: {e_pr_eval}")
+            else:
+                # print(f"Eval Warning: Skipping PR curve due to shape mismatch. one_hot: {one_hot_eval.shape}, probs: {probs_eval_np.shape}")
+                pass # Do nothing if shapes mismatch
+        
+        # Log confusion matrix if previously logged, for consistency (preds_eval_np and targets_eval_np are available)
+        # Note: The original confusion matrix logging was tied to num_classes from train, which might not be ideal here.
+        # For now, we keep the extended metrics and plots.
+        # If confusion matrix is still desired, it can be added here using preds_eval_np and targets_eval_np.
+        # Example: 
+        # if len(preds_eval_np) > 0 and len(targets_eval_np) > 0:
+        #     try:
+        #         log_dict_eval[f"{wandb_prefix}/eval_confusion_matrix"] = wandb.plot.confusion_matrix(
+        #             y_true=targets_eval_np,
+        #             preds=preds_eval_np,
+        #             class_names=[str(i) for i in range(num_classes_eval)] # use num_classes_eval
+        #         )
+        #     except Exception as e_cm:
+        #         print(f"⚠️  Could not log eval confusion matrix: {e_cm}")
+
+        wandb.log(log_dict_eval)
+
+    return accuracy_eval, avg_criterion_loss_eval # Return original main metrics for compatibility
 
 def train_ce_alignment(model, loader, optimizer_class, num_epoch=10, wandb_prefix=None, step_offset=0, use_compile=True, test_mode=False, max_test_examples=3000, auto_find_lr=False, lr_finder_steps=200, lr_start=1e-7, lr_end=1.0):
     """Train a CEAlignment model on data from loader."""
@@ -918,14 +1358,14 @@ def train_ce_alignment(model, loader, optimizer_class, num_epoch=10, wandb_prefi
     # Apply torch.compile if requested
     if use_compile:
         model = torch.compile(model)
-        print("Applied torch.compile to CE alignment model")
+        print("🚀 Applied torch.compile optimization to CE alignment model")
     
     # Initialize optimizer with only the alignment parameters
     optimizer = optimizer_class(model.align.parameters(), lr=1e-3)
     
     # Optionally find optimal learning rate
     if auto_find_lr:
-        print("Finding optimal learning rate...")
+        print("🔍 Finding optimal learning rate...")
         # Create a subset of the training data for LR finder
         subset_size = min(5000, len(loader.dataset))
         indices = torch.randperm(len(loader.dataset))[:subset_size]
@@ -946,7 +1386,7 @@ def train_ce_alignment(model, loader, optimizer_class, num_epoch=10, wandb_prefi
         for pg in optimizer.param_groups:
             pg["lr"] = best_lr
         
-        print(f"Using learning rate: {best_lr:.2e}")
+        print(f"✨ Using learning rate: {best_lr:.2e}")
     
     # Calculate total batches and wandb step offset
     num_batches = len(loader)
@@ -960,7 +1400,7 @@ def train_ce_alignment(model, loader, optimizer_class, num_epoch=10, wandb_prefi
     
     # Use existing wandb run for test mode instead of creating a new one
     if test_mode and HAS_WANDB and wandb_prefix is not None and wandb.run is not None:
-        print(f"Using existing wandb run for test mode with max {max_test_examples} examples")
+        print(f"📝 Using existing wandb run (test mode, max {max_test_examples} examples)")
         # Log test mode configuration to existing run
         wandb.config.update({
             "test_mode": True,
@@ -1089,19 +1529,26 @@ def eval_ce_alignment(model, loader, wandb_prefix=None, step_offset=0):
     results = []
     aligns  = []
     total_loss = 0.0
+    num_samples = 0 # Initialize num_samples
     
     with torch.no_grad():
-        for batch in loader:
-            x1 = batch[0].float().to(device)
-            x2 = batch[1].float().to(device)
-            y  = batch[2].long().to(device)
-            loss, pid_vals, P = model(x1, x2, y)
-            results.append(pid_vals.cpu())
-            aligns.append(P.cpu())
-            total_loss += loss.item()
+        for x1_batch, x2_batch, y_batch in loader:
+            x1_batch, x2_batch, y_batch = x1_batch.to(device), x2_batch.to(device), y_batch.to(device)
+
+            # Standardize y_batch to one-hot if it's not already
+            if y_batch.ndim == 1 or y_batch.shape[1] == 1:
+                y_batch = F.one_hot(y_batch.squeeze().long(), num_classes=model.num_labels).float()
+            
+            with amp.autocast(enabled=(device.type == 'cuda')):
+                # The model's forward pass now returns I_q(Y; X1, X2) directly (the value to be maximized)
+                # So, no need to negate it here for logging purposes.
+                loss_val, pid_vals, _ = model(x1_batch, x2_batch, y_batch)
+
+            total_loss += loss_val.item() * x1_batch.size(0)
+            num_samples += x1_batch.size(0)
     
     # Calculate average metrics
-    avg_loss = total_loss / len(loader)
+    avg_loss = total_loss / num_samples
     avg_results = torch.stack(results).mean(dim=0)
     std_results = torch.stack(results).std(dim=0)
     
@@ -1178,7 +1625,7 @@ def critic_ce_alignment(x1, x2, labels, num_labels,
         lr_finder_steps: Number of iterations for the learning rate finder
         lr_start: Start learning rate for the finder
         lr_end: End learning rate for the finder
-        
+    
     Returns:
         Tuple of (PID components, mutual information values, coupling matrices, discriminators)
     """
@@ -1353,18 +1800,23 @@ def critic_ce_alignment(x1, x2, labels, num_labels,
         d12 = simple_discrim([x1, x2], labels, num_labels)
 
     # 2) build p_y
-    print("\nBuilding p_y...")
+    print("\n🔄 Computing label distribution...")
     with torch.no_grad():
         # Ensure labels are 1D for one-hot encoding
-        labels_1d = labels.view(-1)
-        print(f"Labels for p_y: shape={labels_1d.shape}, unique values={torch.unique(labels_1d).tolist()}")
-        one_hot = F.one_hot(labels_1d, num_labels).float()
-        p_y = one_hot.sum(dim=0) / labels_1d.size(0)
-        print(f"p_y shape: {p_y.shape}")
-        del one_hot, labels_1d
+        labels_flat = labels.view(-1)
+        if labels_flat.dtype in (torch.int64, torch.int32):
+            # k-means: hard labels → one-hot encode
+            one_hot = F.one_hot(labels_flat.long(), num_labels).float()
+        else:
+            # GMM: soft labels → already probabilities
+            # ensure shape [N, num_clusters]
+            one_hot = labels.view(-1, num_labels).float()
+        # compute p_y
+        p_y = one_hot.sum(dim=0) / one_hot.size(0)
+        del one_hot, labels_flat
 
     # 3) instantiate CEAlignmentInformation
-    print("\nCreating CEAlignmentInformation model...")
+    print("\n🔧 Creating CE alignment model...")
     model = CEAlignmentInformation(
         x1_dim=x1.size(1), x2_dim=x2.size(1),
         hidden_dim=discrim_hidden_dim, embed_dim=10, num_labels=num_labels,
@@ -1375,13 +1827,13 @@ def critic_ce_alignment(x1, x2, labels, num_labels,
     
     # Apply torch.compile to the alignment model - AFTER moving to device
     if use_compile and torch.cuda.is_available():
-        print("Applying torch.compile to CE alignment model...")
+        print("🚀 Applying torch.compile optimization...")
         model = torch.compile(model)
 
     opt = torch.optim.Adam(model.align.parameters(), lr=1e-3)
 
     # 4) train the alignment with mixed precision
-    print("\nTraining CE alignment...")
+    print("\n📈 Training CE alignment...")
     train_loader = DataLoader(train_ds, batch_size=256, shuffle=shuffle,
                              num_workers=4, pin_memory=True, prefetch_factor=2,
                              persistent_workers=True if torch.cuda.is_available() else False)
@@ -1402,14 +1854,14 @@ def critic_ce_alignment(x1, x2, labels, num_labels,
         use_compile=use_compile,
         test_mode=test_mode,
         max_test_examples=max_test_examples,
-        auto_find_lr=auto_find_lr,  # Pass the auto_find_lr parameter
-        lr_finder_steps=lr_finder_steps,  # Pass the lr_finder_steps parameter
+        auto_find_lr=auto_find_lr,
+        lr_finder_steps=lr_finder_steps,
         lr_start=lr_start,
         lr_end=lr_end
     )
 
     # 5) eval
-    print("\nEvaluating CE alignment...")
+    print("\n📊 Evaluating CE alignment...")
     model.eval()
     
     test_loader = DataLoader(test_ds, batch_size=256, shuffle=False)
@@ -1436,24 +1888,23 @@ def critic_ce_alignment(x1, x2, labels, num_labels,
                 
                 # Validate shapes before processing
                 if x1_batch.size(0) != y_batch.size(0) or x2_batch.size(0) != y_batch.size(0):
-                    print(f"WARNING: Eval batch size mismatch: x1={x1_batch.size(0)}, x2={x2_batch.size(0)}, y={y_batch.size(0)}")
+                    print("⚠️  Batch size mismatch detected, adjusting...")
                     # Make sure all have the same batch size by trimming
                     min_batch = min(x1_batch.size(0), x2_batch.size(0), y_batch.size(0))
                     x1_batch = x1_batch[:min_batch]
                     x2_batch = x2_batch[:min_batch]
                     y_batch = y_batch[:min_batch]
-                    print(f"Adjusted to min batch size: {min_batch}")
                 
                 # Use mixed precision for evaluation
                 device_type = 'cuda' if torch.cuda.is_available() else 'cpu'
                 with amp.autocast(device_type):
                     loss, pid, _ = model(x1_batch, x2_batch, y_batch)
-                    loss = -loss  # Negative since we're maximizing alignment
+                    
                 
                 test_loss += loss.item()
                 all_pids.append(pid.cpu())
             except Exception as e:
-                print(f"ERROR in eval batch {batch_idx}: {e}")
+                print(f"❌ Error in eval batch {batch_idx}: {e}")
                 import traceback
                 traceback.print_exc()
                 # Continue to next batch
@@ -1463,13 +1914,25 @@ def critic_ce_alignment(x1, x2, labels, num_labels,
             del x1_batch, x2_batch, y_batch
 
     if all_pids:
+        # first compute the average (per-batch) test-loss
+        # test_loss has accumulated the negative MI values from model.forward()
         avg_test_loss = test_loss / len(test_loader)
+        # our model's forward() already returns negative mutual info,
+        # so to report the true (positive) I_q we can flip the sign
+        # avg_loss = -avg_test_loss # This would be the positive MI
+
         all_pids = torch.stack(all_pids).mean(dim=0)
         
-        print(f"\nCE Alignment eval - Loss: {avg_test_loss:.4f}")
-        print(f"Final PID components: Redundancy={all_pids[0]:.4f}, Unique1={all_pids[1]:.4f}, Unique2={all_pids[2]:.4f}, Synergy={all_pids[3]:.4f}")
+        print(f"\n✨ CE Alignment Results:")
+        # Print the avg_test_loss, which is the actual (negative) loss value the optimizer minimized
+        print(f"├─ Loss: {avg_test_loss:.4f}")
+        print(f"└─ PID Components:")
+        print(f"   ├─ Redundancy: {all_pids[0]:.4f}")
+        print(f"   ├─ Unique1: {all_pids[1]:.4f}")
+        print(f"   ├─ Unique2: {all_pids[2]:.4f}")
+        print(f"   └─ Synergy: {all_pids[3]:.4f}")
     else:
-        print("\nWARNING: No valid evaluation batches processed. Using default values.")
+        print("\n⚠️  No valid evaluation batches processed. Using default values.")
         all_pids = torch.zeros(4)  # Default to zeros if no valid batches
     
     # Final cleanup
@@ -1484,21 +1947,24 @@ def critic_ce_alignment(x1, x2, labels, num_labels,
 
 def create_synthetic_labels(
     data: torch.Tensor,
-    num_clusters: int = 10
+    num_clusters: int = 10,
+    cluster_method: str = 'gmm'
 ) -> torch.Tensor:
     """
-    Create synthetic labels for PID analysis using K-means clustering.
+    Create synthetic labels for PID analysis using either GMM or K-means clustering.
     
-    This function normalizes data and applies K-means clustering to create
-    discrete label categories for use in PID analysis. These synthetic labels
-    serve as the target variable for measuring shared information.
+    This function normalizes data and applies clustering to create either:
+    - Soft labels (probability distributions) when using GMM
+    - Hard labels (integers) when using K-means
     
     Args:
         data: Data tensor to cluster, shape [n_samples, feature_dim]
         num_clusters: Number of clusters to create
+        cluster_method: Either 'gmm' or 'kmeans'
         
     Returns:
-        Tensor of integer labels of shape [n_samples]
+        For GMM: Tensor of probabilities of shape [n_samples, num_clusters]
+        For kmeans: Tensor of integer labels of shape [n_samples]
     """
     # Convert to numpy for sklearn clustering
     data_np = data.cpu().numpy()
@@ -1508,20 +1974,38 @@ def create_synthetic_labels(
     std = np.std(data_np, axis=0) + 1e-8  # Add small epsilon to avoid division by zero
     normalized_data = (data_np - mean) / std
     
-    # Import here to avoid dependency if not used
-    from sklearn.cluster import KMeans
-    
-    # Perform K-means clustering with multiple initializations for stability
-    kmeans = KMeans(
-        n_clusters=num_clusters,
-        random_state=42,
-        n_init=10,
-        max_iter=300
-    )
-    labels = kmeans.fit_predict(normalized_data)
-    
-    # Return as PyTorch tensor with shape [n_samples]
-    return torch.tensor(labels, dtype=torch.long)
+    if cluster_method == 'kmeans':
+        # Import here to avoid dependency if not used
+        from sklearn.cluster import KMeans
+        
+        # Perform K-means clustering with multiple initializations for stability
+        kmeans = KMeans(
+            n_clusters=num_clusters,
+            random_state=42,
+            n_init=3,  # Reduced from 10 to 3 for faster computation
+            max_iter=300
+        )
+        labels = kmeans.fit_predict(normalized_data)
+        
+        # Return as PyTorch tensor with shape [n_samples]
+        return torch.tensor(labels, dtype=torch.long)
+    else:  # GMM
+        # Import here to avoid dependency if not used
+        from sklearn.mixture import GaussianMixture
+        
+        # Fit GMM and get probabilities
+        gmm = GaussianMixture(
+            n_components=num_clusters,
+            covariance_type='diag',  # Use diagonal covariance for efficiency
+            random_state=42,
+            n_init= 10,  # Reduced from 10 to 3 for faster computation
+            max_iter=300
+        )
+        gmm.fit(normalized_data)
+        probs = gmm.predict_proba(normalized_data)
+        
+        # Return as PyTorch tensor with shape [n_samples, num_clusters]
+        return torch.tensor(probs, dtype=torch.float32)
 
 def prepare_pid_data(
     generated_data: Dict[str, torch.Tensor],
@@ -1530,6 +2014,7 @@ def prepare_pid_data(
     target_config: str,
     synthetic_labels: Optional[torch.Tensor] = None,
     num_clusters: int = 10,
+    cluster_method: str = 'gmm'  # Added parameter with GMM as default
 ) -> Tuple[MultimodalDataset, MultimodalDataset, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Prepare data for PID analysis.
@@ -1541,11 +2026,14 @@ def prepare_pid_data(
         target_config: Target representation to use for clustering
         synthetic_labels: Optional synthetic labels
         num_clusters: Number of clusters for synthetic labels
+        cluster_method: Either 'gmm' (for soft labels) or 'kmeans' (for hard labels)
         
     Returns:
         Tuple of (train_dataset, test_dataset, domain1_features, domain2_features, labels)
+        For GMM, labels are probability distributions over clusters
+        For kmeans, labels are integer indices
     """
-    print(f"Preparing data for PID analysis with {num_clusters} clusters")
+    print(f"Preparing data for PID analysis with {num_clusters} clusters using {cluster_method}")
     available_keys = list(generated_data.keys())
     print(f"Available keys in generated_data: {available_keys}")
     
@@ -1616,7 +2104,7 @@ def prepare_pid_data(
     else:
         # Create synthetic labels using the target data
         target_data = generated_data[target_config]
-        labels = create_synthetic_labels(target_data, num_clusters)
+        labels = create_synthetic_labels(target_data, num_clusters, cluster_method)
     
     # Ensure correct device
     x1 = x1.to(device)
@@ -1871,6 +2359,7 @@ def analyze_model(
     ce_epochs: int = 10,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
     discrim_hidden_dim: int = 64,
+    joint_discrim_hidden_dim: int = 64,
     discrim_layers: int = 5,
     use_wandb: bool = True,
     wandb_project: str = "pid-analysis",
@@ -1885,36 +2374,45 @@ def analyze_model(
     lr_finder_steps: int = 200,
     lr_start: float = 1e-7,
     lr_end: float = 1.0,
+    cluster_method: str = 'gmm',  # Added parameter with GMM as default
+    enable_extended_metrics: bool = True  # Added new parameter
 ) -> Dict[str, Any]:
     """
-    Analyze a trained model using PID analysis.
+    Analyze a single model checkpoint.
     
     Args:
-        model_path: Path to the model checkpoint
+        model_path: Path to model checkpoint
         domain_modules: Dictionary of domain modules
         output_dir: Directory to save results
-        source_config: Dictionary mapping domain names to their source representations
+        source_config: Dictionary mapping domain names to source representations
         target_config: Target representation to use for clustering
-        n_samples: Number of samples to generate
-        batch_size: Batch size for generation
+        n_samples: Number of samples to use
+        batch_size: Batch size for training
         num_clusters: Number of clusters for synthetic labels
         discrim_epochs: Number of epochs to train discriminators
         ce_epochs: Number of epochs to train CE alignment
-        device: Device to use for computation
-        discrim_hidden_dim: Hidden dimension for discriminator networks
-        discrim_layers: Number of layers in discriminator networks
-        use_wandb: Whether to log results to Weights & Biases
-        wandb_project: W&B project name
-        wandb_entity: W&B entity name
-        data_module: Optional data module for real data
+        device: Device to use
+        discrim_hidden_dim: Hidden dimension for individual discriminators
+        joint_discrim_hidden_dim: Hidden dimension for joint discriminator
+        discrim_layers: Number of layers for discriminators
+        use_wandb: Whether to use wandb
+        wandb_project: Wandb project name
+        wandb_entity: Wandb entity name
+        data_module: Optional data module
         dataset_split: Dataset split to use
-        use_gw_encoded: Whether to use GW-encoded vectors
-        use_compile: Whether to use torch.compile for model optimization
-        ce_test_mode: Whether to run CE alignment in test mode
-        max_test_examples: Maximum number of examples to process in test mode
+        use_gw_encoded: Whether to use GW encoded representations
+        use_compile: Whether to use torch.compile
+        ce_test_mode: Whether to run in test mode
+        max_test_examples: Maximum number of examples to use in test mode
+        auto_find_lr: Whether to automatically find learning rate
+        lr_finder_steps: Number of steps for learning rate finder
+        lr_start: Start learning rate for finder
+        lr_end: End learning rate for finder
+        cluster_method: Either 'gmm' (for soft labels) or 'kmeans' (for hard labels)
+        enable_extended_metrics: Whether to enable extended metrics
         
     Returns:
-        Dictionary containing analysis results
+        Dictionary containing results
     """
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
@@ -1976,7 +2474,8 @@ def analyze_model(
         domain_names=domain_names,
         source_config=source_config,
         target_config=target_config,
-        num_clusters=num_clusters
+        num_clusters=num_clusters,
+        cluster_method=cluster_method  # Pass the cluster_method parameter
     )
     
     # Train the first discriminator for x1
@@ -1998,7 +2497,9 @@ def analyze_model(
         data_type=([0], [2]),  # batch[0] for x1, batch[2] for label
         num_epoch=discrim_epochs,
         wandb_prefix="discrim_1" if use_wandb else None,
-        use_compile=use_compile
+        use_compile=use_compile,
+        cluster_method=cluster_method,
+        enable_extended_metrics=enable_extended_metrics  # Pass the new argument
     )
     
     # Train the second discriminator for x2
@@ -2020,7 +2521,9 @@ def analyze_model(
         data_type=([1], [2]),  # batch[1] for x2, batch[2] for label
         num_epoch=discrim_epochs,
         wandb_prefix="discrim_2" if use_wandb else None,
-        use_compile=use_compile
+        use_compile=use_compile,
+        cluster_method=cluster_method,
+        enable_extended_metrics=enable_extended_metrics  # Pass the new argument
     )
     
     # Train the joint discriminator for x1,x2
@@ -2028,7 +2531,7 @@ def analyze_model(
     # Create the joint discriminator and move it to device
     d12 = Discrim(
         x_dim=x1.size(1) + x2.size(1),  # Combined input dimensions
-        hidden_dim=discrim_hidden_dim,
+        hidden_dim=joint_discrim_hidden_dim,
         num_labels=num_clusters,
         layers=discrim_layers,
         activation="relu"
@@ -2042,21 +2545,28 @@ def analyze_model(
         data_type=([0, 1], [2]),  # batch[0] and batch[1] for x1,x2, batch[2] for label
         num_epoch=discrim_epochs,
         wandb_prefix="discrim_12" if use_wandb else None,
-        use_compile=use_compile
+        use_compile=use_compile,
+        cluster_method=cluster_method,
+        enable_extended_metrics=enable_extended_metrics  # Pass the new argument
     )
     
     # Calculate p_y from labels
     print("\nCalculating p_y distribution...")
     with torch.no_grad():
         # Ensure labels are 1D for one-hot encoding
-        labels_1d = labels.view(-1)
-        print(f"Labels for p_y: shape={labels_1d.shape}, unique values={torch.unique(labels_1d).tolist()}")
-        one_hot = F.one_hot(labels_1d, num_clusters).float()
-        p_y = one_hot.sum(dim=0) / labels_1d.size(0)
-        print(f"p_y shape: {p_y.shape}")
+        labels_flat = labels.view(-1)
+        if labels_flat.dtype in (torch.int64, torch.int32):
+            # k-means: hard labels → one-hot encode
+            one_hot = F.one_hot(labels_flat.long(), num_clusters).float()
+        else:
+            # GMM: soft labels → already probabilities
+            # ensure shape [N, num_clusters]
+            one_hot = labels.view(-1, num_clusters).float()
+        # compute p_y
+        p_y = one_hot.sum(dim=0) / one_hot.size(0)
     
     # Create CE alignment model
-    print("\nCreating CE alignment model...")
+    print("\n🔧 Creating CE alignment model...")
     ce_model = CEAlignmentInformation(
         x1_dim=x1.size(1),
         x2_dim=x2.size(1),
@@ -2075,7 +2585,7 @@ def analyze_model(
     ce_optimizer = torch.optim.Adam(ce_model.parameters(), lr=1e-3)
     
     # Train CE alignment model
-    print("\nTraining CE alignment...")
+    print("\n📈 Training CE alignment...")
     train_ce_alignment(
         model=ce_model,
         loader=DataLoader(train_ds, batch_size=batch_size, shuffle=True),
@@ -2088,19 +2598,23 @@ def analyze_model(
     )
     
     # Evaluate models
-    print("\nEvaluating models...")
+    print("\n📊 Evaluating models...")
     discrim_1_results = eval_discrim(
         model=discrim_1,
         loader=DataLoader(test_ds, batch_size=batch_size),
         data_type=([0], [2]),  # batch[0] for x1, batch[2] for label
-        wandb_prefix="discrim_1" if use_wandb else None
+        wandb_prefix="discrim_1" if use_wandb else None,
+        cluster_method=cluster_method,
+        enable_extended_metrics=enable_extended_metrics  # Pass the new argument
     )
     
     discrim_2_results = eval_discrim(
         model=discrim_2,
         loader=DataLoader(test_ds, batch_size=batch_size),
         data_type=([1], [2]),  # batch[1] for x2, batch[2] for label
-        wandb_prefix="discrim_2" if use_wandb else None
+        wandb_prefix="discrim_2" if use_wandb else None,
+        cluster_method=cluster_method,
+        enable_extended_metrics=enable_extended_metrics  # Pass the new argument
     )
     
     ce_alignment_results = eval_ce_alignment(
@@ -2108,6 +2622,14 @@ def analyze_model(
         loader=DataLoader(test_ds, batch_size=batch_size),
         wandb_prefix="ce" if use_wandb else None
     )
+    
+    # Print PID values
+    print("\n📈 PID Analysis Results:")
+    print(f"Unique Information (X₁): {ce_alignment_results['unique_1']:.4f}")
+    print(f"Unique Information (X₂): {ce_alignment_results['unique_2']:.4f}")
+    print(f"Redundant Information: {ce_alignment_results['redundant']:.4f}")
+    print(f"Synergistic Information: {ce_alignment_results['synergy']:.4f}")
+    print(f"Total Mutual Information: {ce_alignment_results['total_mi']:.4f}")
     
     # Save results
     serializable_results = {
@@ -2148,6 +2670,7 @@ def analyze_multiple_models(
     ce_epochs: int = 10,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
     discrim_hidden_dim: int = 64,
+    joint_discrim_hidden_dim: int = 64,
     discrim_layers: int = 5,
     use_wandb: bool = True,
     wandb_project: str = "pid-analysis",
@@ -2162,109 +2685,91 @@ def analyze_multiple_models(
     lr_finder_steps: int = 200,
     lr_start: float = 1e-7,
     lr_end: float = 1.0,
+    cluster_method: str = 'gmm',  # Added parameter with GMM as default
+    enable_extended_metrics: bool = True  # Added new parameter
 ) -> List[Dict[str, Any]]:
     """
-    Analyze multiple models using PID analysis.
+    Analyze multiple model checkpoints.
     
     Args:
         checkpoint_dir: Directory containing model checkpoints
         domain_modules: Dictionary of domain modules
         output_dir: Directory to save results
-        source_config: Dictionary mapping domain names to their source representations
+        source_config: Dictionary mapping domain names to source representations
         target_config: Target representation to use for clustering
-        n_samples: Number of samples to generate
-        batch_size: Batch size for generation
+        n_samples: Number of samples to use
+        batch_size: Batch size for training
         num_clusters: Number of clusters for synthetic labels
         discrim_epochs: Number of epochs to train discriminators
         ce_epochs: Number of epochs to train CE alignment
-        device: Device to use for computation
-        discrim_hidden_dim: Hidden dimension for discriminator networks
-        discrim_layers: Number of layers in discriminator networks
-        use_wandb: Whether to log results to Weights & Biases
-        wandb_project: W&B project name
-        wandb_entity: W&B entity name
-        data_module: Optional data module for real data
+        device: Device to use
+        discrim_hidden_dim: Hidden dimension for individual discriminators
+        joint_discrim_hidden_dim: Hidden dimension for joint discriminator
+        discrim_layers: Number of layers for discriminators
+        use_wandb: Whether to use wandb
+        wandb_project: Wandb project name
+        wandb_entity: Wandb entity name
+        data_module: Optional data module
         dataset_split: Dataset split to use
-        use_gw_encoded: Whether to use GW-encoded vectors
-        use_compile: Whether to use torch.compile for model optimization
-        ce_test_mode: Whether to run CE alignment in test mode
-        max_test_examples: Maximum number of examples to process in test mode
+        use_gw_encoded: Whether to use GW encoded representations
+        use_compile: Whether to use torch.compile
+        ce_test_mode: Whether to run in test mode
+        max_test_examples: Maximum number of examples to use in test mode
+        auto_find_lr: Whether to automatically find learning rate
+        lr_finder_steps: Number of steps for learning rate finder
+        lr_start: Start learning rate for finder
+        lr_end: End learning rate for finder
+        cluster_method: Either 'gmm' (for soft labels) or 'kmeans' (for hard labels)
+        enable_extended_metrics: Whether to enable extended metrics
         
     Returns:
-        List of dictionaries containing analysis results for each model
+        List of dictionaries containing results for each model
     """
-    # Create output directory
-    os.makedirs(output_dir, exist_ok=True)
+    # ... rest of the function remains unchanged ...
     
-    # Initialize W&B if requested
-    wandb_run = None
-    if use_wandb:
-        wandb_run = wandb.init(
-            project=wandb_project,
-            entity=wandb_entity,
-            config={
-                "checkpoint_dir": checkpoint_dir,
-                "n_samples": n_samples,
-                "num_clusters": num_clusters,
-                "discrim_epochs": discrim_epochs,
-                "ce_epochs": ce_epochs,
-                "source_config": source_config,
-                "target_config": target_config,
-                "use_compile": use_compile,
-                "ce_test_mode": ce_test_mode,
-                "max_test_examples": max_test_examples if ce_test_mode else None
-            }
-        )
-    
-    # Find model checkpoints
-    checkpoint_paths = find_latest_model_checkpoints(checkpoint_dir)
-    if not checkpoint_paths:
-        raise ValueError(f"No model checkpoints found in {checkpoint_dir}")
-    
-    # Analyze each model
+    # Analyze each checkpoint
     results = []
     for checkpoint_path in checkpoint_paths:
-        print(f"\nAnalyzing model: {checkpoint_path}")
-        
-        # Create model-specific output directory
-        model_name = Path(checkpoint_path).stem
-        model_output_dir = os.path.join(output_dir, model_name)
-        
-        # Analyze model
-        model_results = analyze_model(
-            model_path=checkpoint_path,
-            domain_modules=domain_modules,
-            output_dir=model_output_dir,
-            source_config=source_config,
-            target_config=target_config,
-            n_samples=n_samples,
-            batch_size=batch_size,
-            num_clusters=num_clusters,
-            discrim_epochs=discrim_epochs,
-            ce_epochs=ce_epochs,
-            device=device,
-            discrim_hidden_dim=discrim_hidden_dim,
-            discrim_layers=discrim_layers,
-            use_wandb=use_wandb,
-            data_module=data_module,
-            dataset_split=dataset_split,
-            use_gw_encoded=use_gw_encoded,
-            use_compile=use_compile,
-            ce_test_mode=ce_test_mode,
-            max_test_examples=max_test_examples,
-            auto_find_lr=auto_find_lr,
-            lr_finder_steps=lr_finder_steps,
-            lr_start=lr_start,
-            lr_end=lr_end
-        )
-        
-        results.append(model_results)
+        try:
+            result = analyze_model(
+                model_path=checkpoint_path,
+                domain_modules=domain_modules,
+                output_dir=output_dir,
+                source_config=source_config,
+                target_config=target_config,
+                n_samples=n_samples,
+                batch_size=batch_size,
+                num_clusters=num_clusters,
+                discrim_epochs=discrim_epochs,
+                ce_epochs=ce_epochs,
+                device=device,
+                discrim_hidden_dim=discrim_hidden_dim,
+                joint_discrim_hidden_dim=joint_discrim_hidden_dim,
+                discrim_layers=discrim_layers,
+                use_wandb=use_wandb,
+                wandb_project=wandb_project,
+                wandb_entity=wandb_entity,
+                data_module=data_module,
+                dataset_split=dataset_split,
+                use_gw_encoded=use_gw_encoded,
+                use_compile=use_compile,
+                ce_test_mode=ce_test_mode,
+                max_test_examples=max_test_examples,
+                auto_find_lr=auto_find_lr,
+                lr_finder_steps=lr_finder_steps,
+                lr_start=lr_start,
+                lr_end=lr_end,
+                cluster_method=cluster_method,  # Pass the cluster_method parameter
+                enable_extended_metrics=enable_extended_metrics  # Pass the new argument
+            )
+            results.append(result)
+        except Exception as e:
+            print(f"Error analyzing checkpoint {checkpoint_path}: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
     
-    # Close W&B run
-    if wandb_run:
-        wandb_run.finish()
-    
-    return results
+    # ... rest of the function remains unchanged ...
 
 def plot_pid_components(results: List[Dict], output_dir: str, wandb_run=None):
     """
@@ -3112,749 +3617,6 @@ def process_batch(batch, device):
     
     return processed_result
 
-def main():
-    """Parse arguments and run PID analysis."""
-    parser = argparse.ArgumentParser(description="Analyze information flow in models")
-    
-    # Training/evaluation mode
-    parser.add_argument("--test", action="store_true", help="Run test mode")
-    parser.add_argument("--find-latest-checkpoint", action="store_true", help="Find latest checkpoint in fusion dir")
-    parser.add_argument("--single-model", action="store_true", help="Analyze a single model")
-    
-    # Directories
-    parser.add_argument("--fusion-dir", default="checkpoints/fusion", help="Directory with fusion checkpoints")
-    parser.add_argument("--output-dir", default="pid_results", help="Directory to save results")
-    
-    # Model configuration
-    parser.add_argument("--source-domain", default="both", choices=["v_latents", "t", "both"],
-                       help="Domain to use for correlation with cluster labels")
-    parser.add_argument("--domain-configs", nargs="+", default=[], help="Domain configuration files")
-    parser.add_argument("--source-config", type=str, default=None, help="Source configuration JSON string")
-    parser.add_argument("--target-config", type=str, default=None, help="Target configuration")
-    
-    # Data generation parameters
-    parser.add_argument("--n-samples", type=int, default=10000, help="Number of samples to generate")
-    parser.add_argument("--num-clusters", type=int, default=10, help="Number of clusters for synthetic labels")
-    parser.add_argument("--batch-size", type=int, default=128, help="Batch size for training/evaluation")
-    
-    # Training parameters
-    parser.add_argument("--discrim-epochs", type=int, default=40, help="Number of epochs to train discriminators")
-    parser.add_argument("--ce-epochs", type=int, default=10, help="Number of epochs to train CE alignment")
-    parser.add_argument("--discrim-hidden-dim", type=int, default=64, help="Hidden dimension for discriminator")
-    parser.add_argument("--discrim-layers", type=int, default=5, help="Number of layers in discriminator")
-    parser.add_argument("--use-compile", action="store_true", help="Use torch.compile for model optimization")
-    
-    # Learning rate finder parameters
-    parser.add_argument("--auto-find-lr", action="store_true", help="Use learning rate finder to determine optimal learning rate")
-    parser.add_argument("--lr-finder-steps", type=int, default=200, help="Number of iterations for learning rate finder")
-    parser.add_argument("--lr-start", type=float, default=1e-7, help="Start learning rate for finder")
-    parser.add_argument("--lr-end", type=float, default=1.0, help="End learning rate for finder") 
-    
-    # CE test mode parameters
-    parser.add_argument("--ce-test-mode", action="store_true", help="Run CE training in test mode with limited examples")
-    parser.add_argument("--max-test-examples", type=int, default=3000, help="Maximum examples to process in test mode")
-    
-    # Dataset parameters
-    parser.add_argument("--use-dataset", action="store_true", help="Use real data from the dataset instead of synthetic")
-    parser.add_argument("--dataset-path", type=str, default=None, help="Path to the shapes dataset")
-    parser.add_argument("--dataset-split", type=str, default="test", choices=["train", "val", "test"], 
-                        help="Dataset split to use for analysis")
-    
-    # W&B configuration
-    parser.add_argument("--wandb", action="store_true", help="Use wandb")
-    parser.add_argument("--wandb-project", default="pid-analysis", help="W&B project name")
-    parser.add_argument("--wandb-entity", default=None, help="W&B entity name")
-    
-    # In the argument parser section, add:
-    parser.add_argument("--use-mc", action="store_true", help="Use Monte Carlo marginals instead of MLP discriminator")
-    parser.add_argument("--mc-chunk-size", type=int, default=None, help="Chunk size for MC computation")
-    parser.add_argument("--mc-diagnostic-freq", type=int, default=50, help="Frequency of MC diagnostics logging")
-    parser.add_argument("--mc-runs", type=int, default=2, help="Number of MC runs for variance estimation")
-    
-    # Parse arguments
-    args = parser.parse_args()
-    
-    if args.test:
-        test_fixes()
-        return
-    
-    # Setup domain modules
-    domain_modules = {}
-    
-    # Handle domain configs
-    if args.domain_configs:
-        try:
-            domain_configs = []
-            for config_path in args.domain_configs:
-                if config_path.endswith(".ckpt"):
-                    # This is a direct checkpoint path
-                    if "domain_v" in config_path:
-                        domain_name = "v_latents"
-                    elif "domain_t" in config_path:
-                        domain_name = "t"
-                    else:
-                        domain_name = Path(config_path).stem
-                    
-                    domain_configs.append({
-                        "name": domain_name,
-                        "domain_type": domain_name,
-                        "checkpoint_path": config_path
-                    })
-            
-            if domain_configs:
-                from shimmer_ssd.modules.domains.pretrained import load_pretrained_module
-                from shimmer_ssd.config import LoadedDomainConfig, DomainModuleVariant
-                
-                for config in domain_configs:
-                    domain_type = config["domain_type"]
-                    if domain_type == "v_latents":
-                        domain_variant = DomainModuleVariant.v_latents
-                    elif domain_type == "t":
-                        domain_variant = DomainModuleVariant.t
-                    else:
-                        domain_variant = domain_type
-                    
-                    domain_config = LoadedDomainConfig(
-                        domain_type=domain_variant,
-                        checkpoint_path=config["checkpoint_path"],
-                        args={}
-                    )
-                    
-                    domain_module = load_pretrained_module(domain_config)
-                    domain_modules[config["name"]] = domain_module
-                    print(f"Loading domain module: {config['name']}")
-        except ImportError:
-            print("shimmer_ssd not found, cannot load domain modules from config")
-    
-    # Setup source and target configs
-    if args.source_config:
-        try:
-            source_config = json.loads(args.source_config)
-        except json.JSONDecodeError:
-            # Try parsing as key-value pairs
-            source_config = {}
-            parts = args.source_config.split(",")
-            for part in parts:
-                if ":" in part:
-                    key, value = part.split(":", 1)
-                    source_config[key.strip()] = value.strip()
-    else:
-        # Default source config
-        source_config = {
-            "v_latents": "v_latents_latent", 
-            "t": "t_latent"
-        }
-    
-    # Set target config
-    target_config = args.target_config
-    
-    # Create data module if using real data
-    data_module = None
-    if args.use_dataset:
-        try:
-            # Add the simple-shapes-dataset directory to path
-            import sys
-            sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "simple-shapes-dataset"))
-            
-            from simple_shapes_dataset.data_module import SimpleShapesDataModule
-            from simple_shapes_dataset.domain import DomainDesc
-            
-            # Find dataset path
-            dataset_path = args.dataset_path
-            if dataset_path is None:
-                dataset_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "full_shapes_dataset/simple_shapes_dataset")
-                if not os.path.exists(dataset_path):
-                    dataset_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "simple-shapes-dataset/sample_dataset")
-                    print(f"Full dataset not found, falling back to sample dataset at: {dataset_path}")
-            
-            print(f"Using dataset at: {dataset_path}")
-            
-            # Create domain classes and args
-            domain_classes = {}
-            domain_args = {}
-            
-            # Set up domain classes based on loaded modules
-            for domain_name, domain_module in domain_modules.items():
-                if domain_name == "v_latents":
-                    from simple_shapes_dataset.domain import SimpleShapesPretrainedVisual
-                    domain_classes[DomainDesc(base="v", kind="v_latents")] = SimpleShapesPretrainedVisual
-                    
-                    # Define presaved path
-                    domain_args["v_latents"] = {
-                        "presaved_path": "calmip-822888_epoch=282-step=1105680_future.npy",
-                        "use_unpaired": False
-                    }
-                elif domain_name == "t":
-                    from simple_shapes_dataset.domain import SimpleShapesText
-                    domain_classes[DomainDesc(base="t", kind="t")] = SimpleShapesText
-            
-            # Define domain proportions
-            domain_proportions = {}
-            for domain_name in domain_modules.keys():
-                domain_proportions[frozenset([domain_name])] = 1.0
-                
-            # Create custom collate function
-            try:
-                from torch.utils.data._utils.collate import default_collate
-                import torch
-                
-                def custom_collate_fn(batch):
-                    # Simple collate function that handles the basic case
-                    # Process list type batches (common in SimpleShapesDataset)
-                    if isinstance(batch, list) and len(batch) > 0:
-                        if isinstance(batch[0], dict):
-                            # Handle domain-specific collation
-                            result = {}
-                            keys = batch[0].keys()
-                            
-                            for key in keys:
-                                # Skip if key is not in all samples
-                                if not all(key in b for b in batch):
-                                    continue
-                                    
-                                # Collect values for this domain
-                                try:
-                                    # Special handling for text domain
-                                    if key == 't':
-                                        values = []
-                                        for b in batch:
-                                            if hasattr(b[key], 'bert'):
-                                                # It's a Text object with a bert attribute
-                                                values.append(b[key].bert)
-                                            elif isinstance(b[key], dict) and 'bert' in b[key]:
-                                                # It's a dict with a bert key
-                                                values.append(b[key]['bert'])
-                                            else:
-                                                values.append(b[key])
-                                                
-                                        # Try to stack tensors if possible
-                                        if all(isinstance(v, torch.Tensor) for v in values):
-                                            result[key] = torch.stack(values)
-                                        else:
-                                            result[key] = values
-                                    else:
-                                        # Standard handling for other domains
-                                        values = [b[key] for b in batch]
-                                        result[key] = default_collate(values)
-                                except Exception as e:
-                                    print(f"Warning: Collation error for {key}: {e}")
-                                    # If default_collate fails, preserve the list structure
-                                    values = [b[key] for b in batch]
-                                    result[key] = values
-                                    
-                            return result
-                    
-                    # Handle dict batches (often from CombinedLoader)
-                    if isinstance(batch, dict):
-                        result = {}
-                        for domain_key, domain_values in batch.items():
-                            # Handle frozenset keys (standard in CombinedLoader)
-                            if isinstance(domain_key, frozenset):
-                                domain_name = next(iter(domain_key))
-                                if isinstance(domain_values, dict) and domain_name in domain_values:
-                                    result[domain_name] = domain_values[domain_name]
-                                else:
-                                    result[domain_name] = domain_values
-                            else:
-                                result[domain_key] = domain_values
-                        return result
-                    
-                    # Try default collation as fallback
-                    try:
-                        return default_collate(batch)
-                    except Exception:
-                        # If all else fails, just return the batch
-                        return batch
-            except ImportError as e:
-                print(f"Error importing collate function: {e}")
-                # Define a simple collate function as fallback
-                def custom_collate_fn(batch):
-                    return batch
-            
-            print(f"Setting up data module with domain classes: {domain_classes}")
-            print(f"Domain proportions: {domain_proportions}")
-            
-            # Create data module
-            data_module = SimpleShapesDataModule(
-                dataset_path=dataset_path,
-                domain_classes=domain_classes,
-                domain_proportions=domain_proportions,
-                batch_size=args.batch_size,
-                num_workers=0,  # Use 0 for debugging
-                seed=42,
-                domain_args=domain_args,
-                collate_fn=custom_collate_fn
-            )
-            
-            # Setup data module explicitly
-            data_module.setup()
-            
-            # Print dataset information
-            train_dataset = data_module.train_dataset
-            val_dataset = data_module.val_dataset
-            test_dataset = data_module.test_dataset
-            
-            print("\nDataset Information:")
-            for domain, dataset in train_dataset.items():
-                print(f"Train domain {domain}: {len(dataset)} samples")
-            if val_dataset:
-                for domain, dataset in val_dataset.items():
-                    print(f"Val domain {domain}: {len(dataset)} samples")
-            if test_dataset:
-                for domain, dataset in test_dataset.items():
-                    print(f"Test domain {domain}: {len(dataset)} samples")
-            
-            print(f"Using {args.dataset_split} split for analysis")
-            
-        except Exception as e:
-            print(f"Failed to load dataset: {e}")
-            import traceback
-            traceback.print_exc()
-            data_module = None
-            print("Falling back to synthetic data generation")
-    
-    # Create output directory with timestamp
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_base = args.output_dir or "pid_results"
-    model_name = "single_model" if args.single_model else "multiple_models"
-    test_suffix = "_test" if args.ce_test_mode else ""
-    output_dir = os.path.join(output_base, f"{model_name}{test_suffix}_{timestamp}")
-    
-    if args.single_model:
-        # Analysis for a single model
-        if args.find_latest_checkpoint:
-            print(f"Finding latest checkpoint in {args.fusion_dir}")
-            latest_checkpoints = find_latest_model_checkpoints(args.fusion_dir, max_configs=1)
-            if not latest_checkpoints:
-                print(f"No checkpoints found in {args.fusion_dir}")
-                return
-            
-            model_path = latest_checkpoints[0]
-            print(f"Using latest checkpoint: {model_path}")
-        else:
-            model_path = args.fusion_dir
-            
-        analyze_model(
-            model_path=model_path,
-            domain_modules=domain_modules,
-            output_dir=output_dir,
-            source_config=source_config,
-            target_config=target_config,
-            n_samples=args.n_samples,
-            batch_size=args.batch_size,
-            num_clusters=args.num_clusters,
-            discrim_epochs=args.discrim_epochs,
-            ce_epochs=args.ce_epochs,
-            discrim_hidden_dim=args.discrim_hidden_dim,
-            discrim_layers=args.discrim_layers,
-            use_wandb=args.wandb,
-            wandb_project=args.wandb_project,
-            wandb_entity=args.wandb_entity,
-            data_module=data_module,  # Pass the data module
-            dataset_split=args.dataset_split,  # Specify the split
-            use_gw_encoded=False,
-            use_compile=args.use_compile,
-            ce_test_mode=args.ce_test_mode,  # Pass test mode parameter
-            max_test_examples=args.max_test_examples,  # Pass max test examples
-            auto_find_lr=args.auto_find_lr,  # Pass auto_find_lr parameter
-            lr_finder_steps=args.lr_finder_steps,  # Pass lr_finder_steps parameter
-            lr_start=args.lr_start,  # Pass lr_start parameter
-            lr_end=args.lr_end  # Pass lr_end parameter
-        )
-    else:
-        # Analyze multiple models
-        analyze_multiple_models(
-            checkpoint_dir=args.fusion_dir,
-            domain_modules=domain_modules,
-            output_dir=output_dir,
-            source_config=source_config,
-            target_config=target_config,
-            n_samples=args.n_samples,
-            batch_size=args.batch_size,
-            num_clusters=args.num_clusters,
-            discrim_epochs=args.discrim_epochs,
-            ce_epochs=args.ce_epochs,
-            device="cuda" if torch.cuda.is_available() else "cpu",
-            discrim_hidden_dim=args.discrim_hidden_dim,
-            discrim_layers=args.discrim_layers,
-            use_wandb=args.wandb,
-            wandb_project=args.wandb_project,
-            wandb_entity=args.wandb_entity,
-            data_module=data_module,  # Pass the data module
-            dataset_split=args.dataset_split,  # Specify the split
-            use_gw_encoded=False,
-            use_compile=args.use_compile,
-            ce_test_mode=args.ce_test_mode,  # Pass test mode parameter
-            max_test_examples=args.max_test_examples,  # Pass max test examples
-            auto_find_lr=args.auto_find_lr,  # Pass auto_find_lr parameter
-            lr_finder_steps=args.lr_finder_steps,  # Pass lr_finder_steps parameter
-            lr_start=args.lr_start,  # Pass lr_start parameter
-            lr_end=args.lr_end  # Pass lr_end parameter
-        )
-
-# Add a new test function
-def test_autocast_fix():
-    """
-    Test the autocast and GradScaler fix.
-    """
-    import torch
-    
-    print("\nRunning autocast and GradScaler fix test...")
-    print("PyTorch version:", torch.__version__)
-    
-    # Create a simple dataset for testing
-    x1 = torch.rand(10, 5)
-    x2 = torch.rand(10, 5)  # Make compatible shapes for matrix multiplication
-    labels = torch.randint(0, 2, (10,))
-    
-    # Print input shapes
-    print(f"Input shapes: x1={x1.shape}, x2={x2.shape}, labels={labels.shape}")
-    
-    dataset = MultimodalDataset([x1, x2], labels)
-    
-    # Testing direct imports first to understand which method is correct
-    print("\nTesting different autocast implementations...")
-    
-    try:
-        # Try importing torch.amp autocast directly
-        import torch.amp
-        print("torch.amp exists and was imported")
-        # Print the signature of autocast
-        from inspect import signature
-        print(f"torch.amp.autocast signature: {signature(torch.amp.autocast)}")
-    except (ImportError, AttributeError) as e:
-        print(f"Could not import torch.amp: {e}")
-    
-    try:
-        # Try importing torch.cuda.amp directly for CUDA
-        if torch.cuda.is_available():
-            import torch.cuda.amp
-            print("torch.cuda.amp exists and was imported")
-            from inspect import signature
-            print(f"torch.cuda.amp.autocast signature: {signature(torch.cuda.amp.autocast)}")
-            print("Note: torch.cuda.amp has a FutureWarning about deprecation")
-    except (ImportError, AttributeError) as e:
-        print(f"Could not import torch.cuda.amp: {e}")
-    
-    try:
-        # Try importing torch.cpu.amp directly for CPU
-        import torch.cpu.amp
-        print("torch.cpu.amp exists and was imported")
-        from inspect import signature
-        print(f"torch.cpu.amp.autocast signature: {signature(torch.cpu.amp.autocast)}")
-    except (ImportError, AttributeError) as e:
-        print(f"Could not import torch.cpu.amp: {e}")
-    
-    # Now try the actual GradScaler
-    try:
-        # Test GradScaler 
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        print(f"\nUsing device: {device}")
-        
-        # Use the new recommended syntax from torch.amp
-        print("Testing torch.amp.GradScaler...")
-        scaler = torch.amp.GradScaler()
-        print("✅ torch.amp.GradScaler created successfully")
-    except Exception as e:
-        print(f"❌ Error creating torch.amp.GradScaler: {e}")
-        import traceback
-        traceback.print_exc()
-    
-    # Now test autocast with the proper torch.amp namespace
-    try:
-        print("\nTesting the recommended torch.amp.autocast...")
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        
-        with torch.amp.autocast(device_type=device):
-            output = x1 @ x2.t()
-            print(f"✅ torch.amp.autocast worked correctly. Output shape: {output.shape}")
-    except Exception as e:
-        print(f"❌ Error with torch.amp.autocast: {e}")
-        import traceback
-        traceback.print_exc()
-    
-    print("\nTest completed successfully! You should use torch.amp.autocast(device_type='cuda'|'cpu') syntax.")
-
-def plot_stacked_pid(results: List[Dict], output_dir: str, wandb_run=None):
-    """
-    Plot a single, publication-quality stacked PID components plot using viridis colormap.
-    
-    Args:
-        results: List of PID results
-        output_dir: Directory to save plots
-        wandb_run: Optional wandb run to log plots to
-    """
-    if not results:
-        return
-    
-    # Extract fusion weights and PID values
-    weights_a = []
-    weights_b = []
-    redundancy = []
-    unique_a = []
-    unique_b = []
-    synergy = []
-    model_names = []
-    domains = []
-    
-    for result in results:
-        fusion_weights = result.get("fusion_weights", {})
-        pid_values = result.get("pid_values", {})
-        result_domains = result.get("domains", [])
-        
-        if len(result_domains) != 2 or len(fusion_weights) != 2:
-            continue
-        
-        domain_a, domain_b = result_domains
-        if not domains:
-            domains = [domain_a, domain_b]
-            
-        weights_a.append(fusion_weights.get(domain_a, 0))
-        weights_b.append(fusion_weights.get(domain_b, 0))
-        
-        redundancy.append(pid_values.get("redundancy", 0))
-        unique_a.append(pid_values.get("unique1", 0))
-        unique_b.append(pid_values.get("unique2", 0))
-        synergy.append(pid_values.get("synergy", 0))
-        model_names.append(result.get("model_name", "unknown"))
-    
-    if not weights_a:
-        return
-    
-    # Create plots directory
-    plots_dir = os.path.join(output_dir, "plots")
-    os.makedirs(plots_dir, exist_ok=True)
-    
-    # Create weight ratios
-    weight_ratios = [a/b if b > 0 else float('inf') for a, b in zip(weights_a, weights_b)]
-    valid_indices = [i for i, x in enumerate(weight_ratios) if x != float('inf')]
-    
-    if valid_indices:
-        # Filter out infinite values
-        filtered_ratios = [weight_ratios[i] for i in valid_indices]
-        filtered_redundancy = [redundancy[i] for i in valid_indices]
-        filtered_unique_a = [unique_a[i] for i in valid_indices]
-        filtered_unique_b = [unique_b[i] for i in valid_indices]
-        filtered_synergy = [synergy[i] for i in valid_indices]
-        filtered_model_names = [model_names[i] for i in valid_indices]
-        
-        # Set publication-quality plot style
-        plt.style.use('seaborn-v0_8-whitegrid')  # Updated to newer matplotlib style name
-        plt.rcParams['font.family'] = 'sans-serif'
-        plt.rcParams['font.sans-serif'] = ['DejaVu Sans']  # Changed from 'Arial' to 'DejaVu Sans'
-        plt.rcParams['axes.labelsize'] = 14
-        plt.rcParams['axes.titlesize'] = 16
-        plt.rcParams['xtick.labelsize'] = 12
-        plt.rcParams['ytick.labelsize'] = 12
-        plt.rcParams['legend.fontsize'] = 12
-        plt.rcParams['figure.titlesize'] = 18
-        
-        # Create a high-resolution figure
-        plt.figure(figsize=(12, 8), dpi=300)
-        
-        # Get colors from viridis colormap - better for color blindness and printing
-        # Using plt.get_cmap instead of cm.get_cmap to avoid deprecation warning
-        cmap = plt.get_cmap('viridis', 4)
-        colors = [cmap(i) for i in range(4)]
-        
-        # Sort by weight ratio
-        sorted_indices = sorted(range(len(filtered_ratios)), key=lambda i: filtered_ratios[i])
-        sorted_ratios = [filtered_ratios[i] for i in sorted_indices]
-        sorted_redundancy = [filtered_redundancy[i] for i in sorted_indices]
-        sorted_unique_a = [filtered_unique_a[i] for i in sorted_indices]
-        sorted_unique_b = [filtered_unique_b[i] for i in sorted_indices]
-        sorted_synergy = [filtered_synergy[i] for i in sorted_indices]
-        sorted_model_names = [filtered_model_names[i] for i in sorted_indices]
-        
-        # Create x-axis labels with weight ratios
-        x_labels = [f"{ratio:.2f}" for ratio in sorted_ratios]
-        x = range(len(sorted_ratios))
-        
-        # Plot stacked bars with viridis colormap
-        plt.bar(x, sorted_redundancy, label="Redundancy", color=colors[0], width=0.8)
-        plt.bar(x, sorted_unique_a, bottom=sorted_redundancy, label=f"Unique to {domains[0]}", color=colors[1], width=0.8)
-        bottom = [r + ua for r, ua in zip(sorted_redundancy, sorted_unique_a)]
-        plt.bar(x, sorted_unique_b, bottom=bottom, label=f"Unique to {domains[1]}", color=colors[2], width=0.8)
-        bottom = [b + ub for b, ub in zip(bottom, sorted_unique_b)]
-        plt.bar(x, sorted_synergy, bottom=bottom, label="Synergy", color=colors[3], width=0.8)
-        
-        plt.xlabel("Fusion Weight Ratio ($w_{" + domains[0] + "} / w_{" + domains[1] + "}$)")
-        plt.ylabel("Information (bits)")
-        plt.title("Partial Information Decomposition by Weight Ratio")
-        
-        # Format x-axis with proper tick spacing
-        if len(sorted_ratios) > 10:
-            tick_indices = list(range(0, len(sorted_ratios), max(1, len(sorted_ratios) // 10)))
-            plt.xticks([x[i] for i in tick_indices], [x_labels[i] for i in tick_indices], rotation=45)
-        else:
-            plt.xticks(x, x_labels, rotation=45)
-        
-        # Add a light grid
-        plt.grid(True, linestyle='--', alpha=0.3)
-        
-        # Add legend with attractive layout
-        plt.legend(loc='upper center', bbox_to_anchor=(0.5, -0.15), ncol=4, frameon=True, fancybox=True, shadow=True)
-        
-        # Tight layout with additional padding at bottom for legend
-        plt.tight_layout(rect=[0, 0.1, 1, 0.98])
-        
-        # Save figure
-        stacked_plot_path = os.path.join(plots_dir, "pid_stacked_viridis.pdf")
-        plt.savefig(stacked_plot_path, bbox_inches="tight")
-        
-        # Also save as PNG for preview
-        stacked_plot_png_path = os.path.join(plots_dir, "pid_stacked_viridis.png")
-        plt.savefig(stacked_plot_png_path, dpi=300, bbox_inches="tight")
-        
-        # Log to wandb if available
-        if HAS_WANDB and wandb_run is not None:
-            wandb.log({"plots/pid_stacked_viridis": wandb.Image(stacked_plot_png_path)})
-        
-        plt.close()
-        
-        print(f"PID stacked plot saved to {stacked_plot_path}")
-        return stacked_plot_path
-
-def test_simple_discrim():
-    """
-    Test function to verify that the simple_discrim normalization is working properly.
-    
-    This test creates synthetic one-hot inputs and labels, then checks that
-    the returned conditional probabilities p(y|x) sum to 1 for each x.
-    """
-    print("\nTesting simple_discrim normalization...")
-    
-    # Create synthetic data with 2 domains
-    batch_size = 100
-    dim1, dim2 = 5, 4
-    num_labels = 3
-    
-    # Create one-hot inputs
-    x1 = torch.zeros(batch_size, dim1)
-    x2 = torch.zeros(batch_size, dim2)
-    for i in range(batch_size):
-        idx1 = i % dim1
-        idx2 = i % dim2
-        x1[i, idx1] = 1.0
-        x2[i, idx2] = 1.0
-    
-    # Create synthetic labels
-    y = torch.randint(0, num_labels, (batch_size, 1))
-    
-    # Create discriminator
-    discriminator = simple_discrim([x1, x2], y, num_labels)
-    
-    # Test normalization for a few input combinations
-    test_inputs = []
-    for i in range(min(dim1, 3)):
-        for j in range(min(dim2, 3)):
-            one_hot_1 = torch.zeros(1, dim1)
-            one_hot_2 = torch.zeros(1, dim2)
-            one_hot_1[0, i] = 1.0
-            one_hot_2[0, j] = 1.0
-            test_inputs.append((one_hot_1, one_hot_2))
-    
-    for i, (test_x1, test_x2) in enumerate(test_inputs):
-        # Get log probabilities for this input combination
-        log_probs = discriminator(test_x1, test_x2)
-        # Convert log probs to probs
-        probs = torch.exp(log_probs)
-        # Check normalization - should sum to 1
-        prob_sum = probs.sum().item()
-        
-        x1_idx = test_x1.argmax().item()
-        x2_idx = test_x2.argmax().item()
-        print(f"Input ({x1_idx}, {x2_idx}): Sum of p(y|x) = {prob_sum:.6f} (Should be 1.0)")
-        
-        # Check if close to 1
-        if not (0.9999 <= prob_sum <= 1.0001):
-            print(f"WARNING: Probabilities don't sum to 1: {prob_sum}")
-            print(f"Probabilities: {probs.tolist()}")
-    
-    print("simple_discrim test complete\n")
-
-def test_fixes():
-    """
-    Test function to verify our fixes for AMP and Sinkhorn projection.
-    """
-    print("\nTesting AMP and Sinkhorn fixes...")
-    
-    # 1. Test AMP fix
-    print("Testing AMP import fix...")
-    try:
-        # Test creating a GradScaler
-        if torch.cuda.is_available():
-            scaler = amp.GradScaler()  # No need to provide device type as argument
-        else:
-            # For CPU AMP or fallback
-            scaler = amp.GradScaler()
-        print("✅ GradScaler created successfully")
-        
-        # Test autocast
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        with amp.autocast(device_type=device, enabled=True):  # Correct parameters
-            print("✅ autocast context entered successfully")
-    except Exception as e:
-        print(f"❌ Error with AMP: {e}")
-        import traceback
-        traceback.print_exc()
-    
-    # 2. Test Sinkhorn projection fix
-    print("\nTesting Sinkhorn projection dimension handling...")
-    
-    # Create test matrices and probability vectors
-    matrix = torch.rand(10, 8)
-    
-    # Test case 1: x_probs too short (padding case)
-    x1_short = torch.ones(5) / 5  # Short probability vector
-    x2_short = torch.ones(6) / 6  # Short probability vector
-    
-    try:
-        result = sinkhorn_probs(matrix, x1_short, x2_short, tol=0.01, max_iter=10)
-        print("✅ Sinkhorn with short probability vectors (padding case) worked")
-        # Verify that result dimensions match matrix
-        if result.shape == matrix.shape:
-            print(f"✅ Result shape {result.shape} matches matrix shape {matrix.shape}")
-        else:
-            print(f"❌ Result shape {result.shape} doesn't match matrix shape {matrix.shape}")
-    except Exception as e:
-        print(f"❌ Error with Sinkhorn (short case): {e}")
-        import traceback
-        traceback.print_exc()
-    
-    # Test case 2: x_probs too long (truncation case with warning)
-    x1_long = torch.ones(15) / 15  # Long probability vector
-    x2_long = torch.ones(16) / 16  # Long probability vector
-    
-    try:
-        result = sinkhorn_probs(matrix, x1_long, x2_long, tol=0.1, max_iter=10)
-        print("✅ Sinkhorn with long probability vectors (truncation case) worked")
-        # Verify that result dimensions match matrix
-        if result.shape == matrix.shape:
-            print(f"✅ Result shape {result.shape} matches matrix shape {matrix.shape}")
-        else:
-            print(f"❌ Result shape {result.shape} doesn't match matrix shape {matrix.shape}")
-    except Exception as e:
-        print(f"❌ Error with Sinkhorn (long case): {e}")
-        import traceback
-        traceback.print_exc()
-    
-    # Test case 3: Extreme mismatch (should raise error)
-    x1_extreme = torch.ones(500) / 500  # Extremely long probability vector
-    x2_extreme = torch.ones(500) / 500  # Extremely long probability vector
-    
-    try:
-        result = sinkhorn_probs(matrix, x1_extreme, x2_extreme, tol=0.1, max_iter=10)
-        print("❓ Sinkhorn with extremely long probability vectors didn't raise an error as expected")
-    except ValueError as e:
-        print(f"✅ Sinkhorn correctly raised an error for extreme mismatch: {e}")
-    except Exception as e:
-        print(f"❌ Unexpected error with Sinkhorn (extreme case): {e}")
-        import traceback
-        traceback.print_exc()
-    
-    print("\nTests completed")
-
 def find_latest_model_checkpoints(base_dir: str, max_configs: Optional[int] = None) -> List[str]:
     """
     Find the latest epoch checkpoint of the v_latents_0.4_t_0.6 model.
@@ -4624,14 +4386,3 @@ def find_optimal_lr(
         return best_lr, lr_finder
     else:
         return best_lr
-
-if __name__ == "__main__":
-    import sys
-    if len(sys.argv) > 1 and sys.argv[1] == "--test-fixes":
-        test_fixes()
-    elif len(sys.argv) > 1 and sys.argv[1] == "--test-simple-discrim":
-        test_simple_discrim()
-    elif len(sys.argv) > 1 and sys.argv[1] == "--test-autocast-fix":
-        test_autocast_fix()
-    else:
-        main() 

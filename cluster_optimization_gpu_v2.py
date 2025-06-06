@@ -23,6 +23,7 @@ import json
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any, Union
 from datetime import datetime
+import gc  # Add gc import here
 
 # Numerical and ML libraries
 import numpy as np
@@ -47,18 +48,25 @@ except ImportError:
     HAS_WANDB = False
     print("Warning: wandb not installed. Run 'pip install wandb' to enable experiment tracking.")
 
-# Import key functions from analyze_pid
+# Import key functions from analyze_pid and sweep_pid_discrim
 try:
-    # Uncomment for normal operation
+    # Import from analyze_pid
     from analyze_pid import (
         generate_samples_from_model,
         load_domain_modules,
         load_checkpoint,
-        generate_samples_from_dataset
+        generate_samples_from_dataset_fixed as generate_samples_from_dataset
+    )
+    # Import from sweep_pid_discrim for proper batch processing
+    from sweep_pid_discrim import (
+        process_batch_vectorized,
+        process_domain_value,
+        process_domain_data_vectorized,
+        optimized_collate_fn
     )
 except ImportError:
-    print("Error: analyze_pid.py not found in the current path.")
-    print("Required for loading domain modules and generating samples.")
+    print("Error: Required modules not found in the current path.")
+    print("Required: analyze_pid.py and sweep_pid_discrim.py")
     # Do not exit if we're just using test_data mode
     if '--test-data' not in sys.argv:
         sys.exit(1)
@@ -74,6 +82,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger('cluster_optimization_gpu')
 
+def custom_collate_fn(batch):
+    """Custom collate function that handles both tensor and list data."""
+    from torch.utils.data._utils.collate import default_collate
+    try:
+        return default_collate(batch)
+    except Exception:
+        return batch
 
 # ================================================
 # Core GMM Fitting Functions
@@ -148,7 +163,8 @@ def fit_gmm_with_metrics_gpu(
         data_for_tensor = data
     
     # Convert numpy data to PyTorch tensor and move to the correct device
-    data_tensor = torch.tensor(data_for_tensor, dtype=torch.float16, device=torch_device)
+    # Create a single data_tensor that will be used for both fitting and prediction
+    data_tensor = torch.tensor(data_for_tensor, dtype=torch.float32, device=torch_device)
     
     # Fit GMM using gmm-torch - create it on the same device
     best_gmm = None
@@ -180,9 +196,16 @@ def fit_gmm_with_metrics_gpu(
                 best_log_likelihood = gmm.log_likelihood
                 best_gmm = gmm
                 logger.debug(f"Found better model in attempt {attempt+1} with log likelihood: {best_log_likelihood}")
+                
+            # Clean up this attempt's resources
+            if gmm != best_gmm:  # Only delete if not the best model
+                del gmm
+            torch.cuda.empty_cache()
+            
         except Exception as e:
-            # delete any large objects
-            del gmm, data_tensor
+            # Clean up failed attempt's resources
+            if 'gmm' in locals():
+                del gmm
             # release cached CUDA memory to the OS
             torch.cuda.empty_cache()
             # collect any lingering CPU‐side references
@@ -197,7 +220,7 @@ def fit_gmm_with_metrics_gpu(
     # Use the best model
     gmm = best_gmm
     
-    # Get cluster assignments and probabilities
+    # Get cluster assignments and probabilities using the preserved data_tensor
     labels = gmm.predict(data_tensor)
     log_probs = gmm.score_samples(data_tensor)
     
@@ -301,9 +324,6 @@ def fit_gmm_range_gpu(
     # Set base random seed
     base_seed = random_state
     
-    # Convert data to tensor once, rather than in each call
-    data_tensor = torch.tensor(data, dtype=torch.float32)
-    
     # Process each k value sequentially (on GPU)
     logger.info(f"Fitting GMMs on {device} with {n_runs_per_k} runs per k value...")
     for k in tqdm(k_range, desc='Fitting GMMs'):
@@ -319,6 +339,8 @@ def fit_gmm_range_gpu(
             
             try:
                 logger.info(f"Fitting GMM with k={k}, run {run+1}/{n_runs_per_k}, seed {curr_seed}")
+                
+                # ── call the inner fit
                 result = fit_gmm_with_metrics_gpu(
                     data=data,
                     k=k,
@@ -332,7 +354,7 @@ def fit_gmm_range_gpu(
                 # Track the best model based on BIC
                 if result['bic'] < best_bic:
                     best_bic = result['bic']
-                    best_labels = result['labels']
+                    best_labels = result['labels'].copy()  # Make a copy to ensure we keep it
                     best_run_idx = run
                 
                 # Store metrics from this run
@@ -341,12 +363,27 @@ def fit_gmm_range_gpu(
                 results['all_runs'][k]['log_likelihood'].append(result['log_likelihood'])
                 results['all_runs'][k]['random_states'].append(curr_seed)
                 
-                # Explicitly clean up GPU resources
+                # ── immediately free the heavy objects
                 if 'gmm' in result:
+                    # move it to CPU (or delete) so its GPU memory can be reclaimed
+                    try:
+                        result['gmm'].to('cpu')
+                    except Exception:
+                        pass
                     del result['gmm']
+                
+                # delete large arrays and tensors
+                del result['labels']
+                # Clean up all temporary keys we don't need
+                for key in ['total_log_likelihood', 'log_likelihood', 'standardization']:
+                    if key in result:
+                        del result[key]
+                # now remove the dict itself
                 del result
+                
+                # clear CUDA cache and force Python GC
                 torch.cuda.empty_cache()
-                import gc; gc.collect()
+                gc.collect()
                 
             except Exception as e:
                 logger.warning(f"Error fitting GMM with k={k}, run {run+1}: {e}")
@@ -359,7 +396,7 @@ def fit_gmm_range_gpu(
                 
                 # Ensure GPU is cleared
                 torch.cuda.empty_cache()
-                import gc; gc.collect()
+                gc.collect()
         
         # Calculate mean and std from all runs for this k
         bic_values = results['all_runs'][k]['bic']
@@ -383,6 +420,10 @@ def fit_gmm_range_gpu(
         
         # Only store labels for the best model from all runs to save memory
         results['best_labels'].append(best_labels if best_labels is not None else np.zeros(data.shape[0]))
+        
+        # Clean up after processing each k
+        del best_labels
+        gc.collect()
     
     return results
 
@@ -716,38 +757,24 @@ def analyze_domain_clusters_gpu(
     fusion_dir: Optional[str] = None,
     max_configs: Optional[int] = None,
     data_module = None,
-    dataset_split: str = "test",
-    use_gw_processed: bool = False,
+    dataset_split: str = "train",
+    latent_space: str = "fused",
+    use_gw_encoded: bool = False,  # Kept for backward compatibility
     runs_per_k: int = 3,
     standardize: bool = True
 ) -> Dict:
-    """
-    GPU-accelerated analysis of optimal number of clusters for each domain.
+    # Handle deprecated flag
+    if use_gw_encoded:
+        logger.warning("--use-gw-encoded is deprecated. Please use --latent-space=decoded instead.")
+        latent_space = "decoded"
+
+    # Create timestamp for output
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     
-    Args:
-        model_paths: List of model checkpoint paths
-        domain_modules: Dictionary of domain modules
-        domain_names: List of domain names to analyze
-        output_dir: Directory to save results
-        k_range: Range of cluster numbers to try
-        n_samples: Number of samples to generate per model
-        batch_size: Batch size for generation
-        device: Device to run on
-        use_wandb: Whether to log to wandb
-        wandb_project: Wandb project name
-        wandb_entity: Wandb entity name
-        find_latest: Whether to find the latest checkpoints in the fusion directory
-        fusion_dir: Directory containing fusion model configurations
-        max_configs: Maximum number of recent configs to include
-        data_module: Optional data module for generating samples from real dataset
-        dataset_split: Dataset split to use when using data_module ("train", "val", or "test")
-        use_gw_processed: Whether to use GW-processed latents (through encode & decode) instead of original
-        runs_per_k: Number of runs to perform for each k value with different random seeds
-        standardize: Whether to standardize features before fitting GMMs
-        
-    Returns:
-        Dictionary with results for each domain
-    """
+    # Create output directory
+    results_dir = os.path.join(output_dir, f"cluster_optimization_{timestamp}")
+    os.makedirs(results_dir, exist_ok=True)
+    
     # If find_latest is True, override model_paths with latest checkpoints
     if find_latest and fusion_dir is not None:
         logger.info(f"Finding latest checkpoints in {fusion_dir}")
@@ -759,12 +786,16 @@ def analyze_domain_clusters_gpu(
             for path in model_paths:
                 logger.info(f"  - {path}")
     
-    # Create timestamp for output
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
-    # Create output directory
-    results_dir = os.path.join(output_dir, f"cluster_optimization_{timestamp}")
-    os.makedirs(results_dir, exist_ok=True)
+    # Load model if we need to use GW encoders (for fused latent space)
+    model = None
+    if latent_space == "fused" and model_paths:
+        logger.info(f"Loading model from {model_paths[0]} for GW encoding")
+        try:
+            model = load_checkpoint(model_paths[0], domain_modules, device)
+            model.eval()
+        except Exception as e:
+            logger.error(f"Failed to load model: {e}")
+            return {}
     
     # Initialize wandb if requested
     wandb_run = None
@@ -777,7 +808,7 @@ def analyze_domain_clusters_gpu(
                 "k_range": k_range,
                 "data_source": "dataset" if data_module else "synthetic",
                 "dataset_split": dataset_split if data_module else "N/A",
-                "use_gw_processed": use_gw_processed,
+                "latent_space": latent_space,
                 "runs_per_k": runs_per_k,
                 "standardize": standardize
             }
@@ -792,107 +823,223 @@ def analyze_domain_clusters_gpu(
             logger.warning(f"Failed to initialize wandb: {e}")
             wandb_run = None
     
-    # Ensure we have at least one model path
-    if not model_paths:
-        logger.error("No model paths found. Please check your configuration.")
-        return {}
-        
     # Results container
-    results = {domain: {} for domain in domain_names}
+    if latent_space == "fused":
+        # When using fused representation, we only analyze one space
+        results = {"fused": {}}
+        all_samples = {"fused": []}
+    else:
+        # For other modes, analyze each domain separately
+        results = {domain: {} for domain in domain_names}
+        all_samples = {domain: [] for domain in domain_names}
     
-    # Collect samples from all models
-    all_samples = {domain: [] for domain in domain_names}
-    
-    logger.info(f"Collecting samples from {len(model_paths)} models...")
-    
-    for model_path in tqdm(model_paths, desc="Processing Models"):
-        # Generate samples
-        try:
-            # Check if file exists
-            if not os.path.exists(model_path):
-                logger.error(f"Model file does not exist: {model_path}")
-                continue
-                
-            # Load model and generate samples
-            logger.info(f"Loading model from {model_path}")
-            try:
-                model = load_checkpoint(model_path, domain_modules, device)
-            except Exception as e:
-                logger.error(f"Failed to load checkpoint {model_path}: {e}")
-                traceback.print_exc()
-                continue
-            
-            # Generate samples - use dataset if provided, otherwise generate synthetic
-            logger.info(f"Generating {n_samples} samples")
-            try:
-                if data_module:
-                    logger.info(f"Using real data from {dataset_split} split")
-                    samples = generate_samples_from_dataset(
-                        model=model,
-                        data_module=data_module,
-                        domain_names=domain_names,
-                        split=dataset_split,
-                        n_samples=n_samples,
-                        batch_size=batch_size,
-                        device=device
-                    )
-                    # Adjust keys to match what's expected by later code
-                    # Choose either original latents or GW-processed latents
-                    domain_samples = {}
-                    for domain in domain_names:
-                        if use_gw_processed:
-                            # Use GW-processed latents (encoded & decoded)
-                            if f"{domain}_decoded" in samples:
-                                domain_samples[domain] = samples[f"{domain}_decoded"]
-                                logger.info(f"Using GW-processed latents for {domain}")
-                            else:
-                                logger.warning(f"{domain}_decoded not found in samples")
-                        else:
-                            # Use original latents
-                            if f"{domain}_orig" in samples:
-                                domain_samples[domain] = samples[f"{domain}_orig"]
-                                logger.info(f"Using original latents for {domain}")
-                            else:
-                                logger.warning(f"{domain}_orig not found in samples")
-                    samples = domain_samples
-                else:
-                    logger.info("Generating synthetic samples")
-                    samples = generate_samples_from_model(
-                        model=model,
-                        domain_names=domain_names,
-                        n_samples=n_samples,
-                        batch_size=batch_size,
-                        device=device
-                    )
-            except Exception as e:
-                logger.error(f"Failed to generate samples from {model_path}: {e}")
-                traceback.print_exc()
-                continue
-            
-            # Collect samples for each domain
-            for domain in domain_names:
-                if domain in samples:
-                    all_samples[domain].append(samples[domain])
-                else:
-                    logger.warning(f"Domain {domain} not found in samples from {model_path}")
-        except Exception as e:
-            logger.error(f"Error processing model {model_path}: {e}")
-            traceback.print_exc()
-    
-    # Print debug info about collected samples
+    # Verify domain modules
     for domain in domain_names:
+        if domain not in domain_modules:
+            raise ValueError(f"Domain module not found for {domain}")
+        logger.info(f"Found domain module for {domain}")
+        
+    # Verify text domain handling
+    if 't' in domain_names:
+        logger.info("Text domain found - will ensure proper BERT embedding handling")
+        
+    # Log data module information
+    if data_module:
+        logger.info(f"Using real data from {dataset_split} split")
+        if not hasattr(data_module, f"{dataset_split}_dataset"):
+            raise ValueError(f"Data module does not have {dataset_split} dataset")
+        logger.info(f"Data module has {dataset_split} dataset")
+    
+    logger.info(f"Collecting samples from {len(model_paths) if model_paths else 'dataset'}")
+    
+    # Process samples
+    try:
+        if data_module:
+            # Using real data
+            logger.info("Processing real data samples...")
+            
+            # Get the appropriate dataloader
+            if dataset_split == 'train':
+                dataloader = data_module.train_dataloader()
+            elif dataset_split == 'val':
+                dataloader = data_module.val_dataloader()
+            else:  # test
+                dataloader = data_module.test_dataloader()
+            
+            # Process batches and encode with domain modules
+            total_samples = 0
+            max_samples = n_samples if n_samples is not None else float('inf')
+            
+            with torch.no_grad():
+                for batch_idx, batch in enumerate(dataloader):
+                    if batch_idx % 10 == 0:
+                        logger.info(f"Processing batch {batch_idx}")
+                    
+                    try:
+                        # Process batch using process_batch_vectorized
+                        processed_batch = process_batch_vectorized(batch, device)
+                        
+                        # Check if we have all required domains
+                        if not all(domain in processed_batch for domain in domain_names):
+                            logger.warning(f"Skipping batch {batch_idx} - missing domains")
+                            continue
+                        
+                        # Get batch size and check if we would exceed max_samples
+                        batch_size = next(iter(processed_batch.values())).size(0)
+                        if total_samples + batch_size > max_samples:
+                            # Truncate batch to exactly reach max_samples
+                            samples_needed = max_samples - total_samples
+                            for domain_name in processed_batch:
+                                processed_batch[domain_name] = processed_batch[domain_name][:samples_needed]
+                            batch_size = samples_needed
+                        
+                        # Encode each domain
+                        encoded_samples = {}
+                        for domain_name, module in domain_modules.items():
+                            if domain_name in processed_batch:
+                                # Get data for this domain
+                                domain_data = processed_batch[domain_name]
+                                
+                                # Store raw data for later encoding through model's domain modules
+                                encoded_samples[domain_name] = domain_data
+                                logger.info(f"Stored raw {domain_name} domain data with shape {domain_data.shape}")
+                        
+                        # Create fused representation if needed
+                        if latent_space == "fused":
+                            if model is not None:
+                                # First encode each domain using domain modules
+                                gw_states = {}
+                                for domain_name, encoded_data in encoded_samples.items():
+                                    if domain_name == 't':
+                                        # For text domain, project the raw BERT embeddings then go straight to GW encoder
+                                        if hasattr(domain_modules[domain_name], 'projector'):
+                                            projected_data = domain_modules[domain_name].projector(encoded_data)
+                                            logger.info(f"Projected raw text embeddings from {encoded_data.shape} to {projected_data.shape}")
+                                            
+                                            # Skip domain module encoder (BERT) and go straight to GW encoder
+                                            gw_state = model.gw_encoders[domain_name](projected_data)
+                                            logger.info(f"GW encoded projected text through GW encoder to {gw_state.shape}")
+                                    else:
+                                        # For vision domain, encode through domain module
+                                        domain_encoded = model.domain_mods[domain_name].encode(encoded_data)
+                                        logger.info(f"Encoded vision domain through domain module to {domain_encoded.shape}")
+                                        
+                                        # Handle v_latents extra dimensions BEFORE GW encoder
+                                        if domain_name == 'v_latents' and domain_encoded.dim() > 2:
+                                            domain_encoded = domain_encoded[:, 0, :]
+                                            logger.info(f"Handled extra dimensions for v_latents: shape now {domain_encoded.shape}")
+                                        
+                                        # Then encode through GW encoder
+                                        gw_state = model.gw_encoders[domain_name](domain_encoded)
+                                        logger.info(f"GW encoded {domain_name} domain to {gw_state.shape}")
+                                    
+                                    gw_states[domain_name] = gw_state
+                                
+                                # Create weighted fusion using model's fusion weights and apply tanh
+                                fused_gw = torch.tanh(model.fuse(gw_states, None))  # Selection scores are ignored in GWModuleConfigurableFusion
+                                logger.info(f"Created fused GW representation with tanh activation, shape {fused_gw.shape}")
+                                
+                                # Use fused GW representation for clustering
+                                data_tensor = fused_gw
+                                logger.info(f"Using fused GW representation for clustering with shape {data_tensor.shape}")
+                                
+                                # Store the fused representation
+                                all_samples["fused"].append(data_tensor.cpu())
+                                logger.info(f"Stored fused representation with shape {data_tensor.shape}")
+                            else:
+                                raise ValueError("Model is required for fused latent space")
+                        else:
+                            # Store individual domain samples
+                            for domain in domain_names:
+                                all_samples[domain].append(encoded_samples[domain].cpu())
+                                
+                        # Update total samples count
+                        total_samples += batch_size
+                        
+                        # Stop if we've reached max_samples
+                        if total_samples >= max_samples:
+                            logger.info(f"Reached requested number of samples ({max_samples})")
+                            break
+                        
+                        # Periodically clear cache
+                        if batch_idx % 50 == 0:
+                            torch.cuda.empty_cache()
+                            
+                    except Exception as e:
+                        logger.error(f"Error processing batch {batch_idx}: {e}")
+                        traceback.print_exc()
+                        continue
+
+        else:
+            # Using synthetic data or model generation
+            for model_path in tqdm(model_paths, desc="Processing Models"):
+                try:
+                    if not os.path.exists(model_path):
+                        logger.error(f"Model file does not exist: {model_path}")
+                        continue
+                    
+                    logger.info(f"Loading model from {model_path}")
+                    try:
+                        model = load_checkpoint(model_path, domain_modules, device)
+                    except Exception as e:
+                        logger.error(f"Failed to load checkpoint {model_path}: {e}")
+                        traceback.print_exc()
+                        continue
+                    
+                    # Generate and process samples
+                    try:
+                        samples = generate_samples_from_model(
+                            model=model,
+                            domain_names=domain_names,
+                            n_samples=n_samples,
+                            batch_size=batch_size,
+                            device=device
+                        )
+                        
+                        if latent_space == "fused":
+                            if "gw_rep" not in samples:
+                                logger.warning(f"gw_rep not found in samples from {model_path}")
+                                continue
+                            all_samples["fused"].append(samples["gw_rep"])
+                            logger.info(f"Added fused representation from {model_path}")
+                        else:
+                            for domain in domain_names:
+                                if domain not in samples:
+                                    logger.warning(f"Domain {domain} not found in samples from {model_path}")
+                                    continue
+                                all_samples[domain].append(samples[domain])
+                                logger.info(f"Added {domain} samples from {model_path}")
+                                
+                    except Exception as e:
+                        logger.error(f"Failed to generate/process samples from {model_path}: {e}")
+                        traceback.print_exc()
+                        continue
+                        
+                except Exception as e:
+                    logger.error(f"Error processing model {model_path}: {e}")
+                    traceback.print_exc()
+                    continue
+    
+    except Exception as e:
+        logger.error(f"Fatal error during sample collection: {e}")
+        traceback.print_exc()
+        return {}
+
+    # Print debug info about collected samples
+    domains_to_analyze = ["fused"] if latent_space == "fused" else domain_names
+    for domain in domains_to_analyze:
         sample_count = len(all_samples[domain])
-        logger.info(f"Sample collection for {domain}: collected from {sample_count}/{len(model_paths)} models")
+        logger.info(f"Sample collection for {domain}: collected from {sample_count} sources")
         if sample_count == 0:
             logger.warning(f"No samples collected for domain: {domain}")
     
     # Check if we have any samples
     if all(len(samples) == 0 for samples in all_samples.values()):
-        logger.error("No samples collected from any model. Aborting analysis.")
+        logger.error("No samples collected from any source. Aborting analysis.")
         return {}
         
     # Analyze each domain separately
-    for domain in domain_names:
+    for domain in domains_to_analyze:
         if not all_samples[domain]:
             continue
             
@@ -1410,14 +1557,22 @@ def parse_arguments():
     dataset_group.add_argument(
         "--dataset-split",
         type=str,
-        default="test",
+        default="train",
         choices=["train", "val", "test"],
         help="Dataset split to use when using real data"
     )
     dataset_group.add_argument(
-        "--use-gw-processed",
+        "--latent-space",
+        type=str,
+        default="fused",
+        choices=["orig", "fused", "decoded"],
+        help="Which latent space to use: orig (v_latents_orig), fused (after fusion of both modalities), or decoded (v_latents_decoded)"
+    )
+    # Keep for backward compatibility but mark as deprecated
+    dataset_group.add_argument(
+        "--use-gw-encoded",
         action="store_true",
-        help="Use GW-processed latents (encoded through GW & decoded) instead of original"
+        help="DEPRECATED: Use --latent-space=decoded instead. Use decoded latents (encoded through GW & decoded)"
     )
     
     # Parse arguments
@@ -1425,13 +1580,7 @@ def parse_arguments():
 
 
 def main():
-    """
-    Main entry point for the script.
-    
-    Returns:
-        Exit code: 0 for success, non-zero for errors
-    """
-    # Parse command-line arguments
+    """Main function to run cluster optimization."""
     args = parse_arguments()
     
     # Set up logging
@@ -1478,26 +1627,43 @@ def main():
         )
         return 0 if result else 1
     
-    # Otherwise, use model checkpoints
-    if args.checkpoint_dir is None and not args.find_latest_checkpoints:
-        logger.error("Either --test-data, --checkpoint-dir, or --find-latest-checkpoints must be provided")
-        return 1
+    # Initialize model_paths
+    model_paths = []
     
-    if args.checkpoint_dir is not None and not args.find_latest_checkpoints and not os.path.isdir(args.checkpoint_dir):
-        logger.error(f"Checkpoint directory does not exist: {args.checkpoint_dir}")
-        return 1
-    
-    # If using latest checkpoints, verify fusion directory exists
+    # Handle model path loading based on arguments
     if args.find_latest_checkpoints:
         if not os.path.isdir(args.fusion_dir):
             logger.error(f"Fusion directory does not exist: {args.fusion_dir}")
             return 1
             
-        # Print information about what we're looking for
         logger.info(f"Looking for latest checkpoints in {args.fusion_dir}")
         if args.max_configs is not None:
             logger.info(f"Will use up to {args.max_configs} most recent configurations")
-    
+            
+        # Model paths will be loaded in analyze_domain_clusters_gpu
+    elif args.checkpoint_dir is not None:
+        if not os.path.isdir(args.checkpoint_dir):
+            logger.error(f"Checkpoint directory does not exist: {args.checkpoint_dir}")
+            return 1
+            
+        for path in Path(args.checkpoint_dir).rglob("*.pt"):
+            if "_metadata" not in path.name:  # Skip metadata files
+                model_paths.append(str(path))
+                
+        if not model_paths:
+            logger.error(f"No model checkpoints found in {args.checkpoint_dir}")
+            return 1
+            
+        if args.max_models > 0 and len(model_paths) > args.max_models:
+            logger.info(f"Limiting analysis to {args.max_models} models (out of {len(model_paths)})")
+            model_paths = model_paths[:args.max_models]
+            
+        logger.info(f"Found {len(model_paths)} model checkpoints")
+    else:
+        if args.latent_space == "fused":
+            logger.error("For fused latent space, either --find-latest-checkpoints or --checkpoint-dir must be provided")
+            return 1
+
     # Process domain configs
     domain_configs = []
     for path in args.domain_configs:
@@ -1576,13 +1742,6 @@ def main():
                 domain_proportions[frozenset([domain_name])] = 1.0
                 
             # Create custom collate function
-            def simple_collate_fn(batch):
-                from torch.utils.data._utils.collate import default_collate
-                try:
-                    return default_collate(batch)
-                except Exception:
-                    return batch
-            
             data_module = SimpleShapesDataModule(
                 dataset_path=dataset_path,
                 domain_classes=domain_classes,
@@ -1591,7 +1750,7 @@ def main():
                 num_workers=4,
                 seed=42,
                 domain_args=domain_args,
-                collate_fn=simple_collate_fn
+                collate_fn=optimized_collate_fn
             )
             data_module.setup()
             logger.info(f"Data module initialized, will use {args.dataset_split} split")
@@ -1604,26 +1763,6 @@ def main():
             import traceback
             traceback.print_exc()
             args.use_dataset = False
-    
-    # Find model checkpoints if not using fusion latest mode
-    model_paths = []
-    if not args.find_latest_checkpoints and args.checkpoint_dir is not None:
-        for path in Path(args.checkpoint_dir).rglob("*.pt"):
-            # Skip metadata files
-            if "_metadata" in path.name:
-                continue
-            model_paths.append(str(path))
-        
-        if not model_paths:
-            logger.error(f"No model checkpoints found in {args.checkpoint_dir}")
-            return 1
-        
-        # Limit number of models if needed
-        if args.max_models > 0 and len(model_paths) > args.max_models:
-            logger.info(f"Limiting analysis to {args.max_models} models (out of {len(model_paths)})")
-            model_paths = model_paths[:args.max_models]
-        
-        logger.info(f"Found {len(model_paths)} model checkpoints")
     
     # Run analysis with GPU acceleration
     results = analyze_domain_clusters_gpu(
@@ -1643,7 +1782,8 @@ def main():
         max_configs=args.max_configs,
         data_module=data_module,
         dataset_split=args.dataset_split,
-        use_gw_processed=args.use_gw_processed,
+        latent_space=args.latent_space,
+        use_gw_encoded=args.use_gw_encoded,
         runs_per_k=args.runs_per_k,
         standardize=standardize
     )

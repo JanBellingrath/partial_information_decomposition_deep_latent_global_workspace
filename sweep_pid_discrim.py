@@ -47,104 +47,124 @@ CACHED_FEATURES = None
 
 # Define a wrapper class for gmm-torch to maintain compatibility
 class TorchGMM:
-    """Wrapper for gmm-torch's GaussianMixture with multi-init support."""
+    """Wrapper for scikit-learn's GaussianMixture with PyTorch tensor support."""
     def __init__(
         self,
         n_components: int = 10,
-        n_init: int = 10,
+        n_init: int = 3,  # Reduced from 10 to 3 for faster computation while maintaining reasonable stability
         max_iter: int = 300,
-        covariance_type: str = 'full',
+        covariance_type: str = 'diag',  # Using diagonal covariance for better computational efficiency
         eps: float = 1e-6,
         init_params: str = 'kmeans'
     ):
         self.n_components   = n_components
         self.n_init         = n_init
         self.max_iter       = max_iter
-        self.covariance_type= covariance_type
+        self.covariance_type= 'diag'  # Force diagonal covariance regardless of input
         self.eps            = eps
         self.init_params    = init_params
         self.device         = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model          = None
+        
+        # Import scikit-learn's GMM
+        from sklearn.mixture import GaussianMixture
+        self.GMM = GaussianMixture
 
     def fit(self, X: Union[np.ndarray, torch.Tensor]) -> "TorchGMM":
-        # ensure tensor on correct device
-        if not torch.is_tensor(X):
-            X = torch.from_numpy(X).float()
-        X = X.to(self.device)
-        n_features = X.shape[1]
-
-        best_ll = -float('inf')
-        best_gmm = None
-
-        # manually do n_init runs
-        for seed in range(self.n_init):
-            torch.manual_seed(seed)
-            # instantiate with correct signature
-            gmm = GaussianMixture(
-                n_components=self.n_components,
-                n_features=n_features,
-                covariance_type=self.covariance_type,
-                eps=self.eps,
-                init_params=self.init_params
-            ).to(self.device)
-
-            # fit signature: .fit(data, n_iter, delta, warm_start)
-            gmm.fit(X, n_iter=self.max_iter, delta=1e-3, warm_start=False)
-
-            if gmm.log_likelihood > best_ll:
-                best_ll = gmm.log_likelihood
-                best_gmm = gmm
-
-        if best_gmm is None:
-            raise RuntimeError("All GMM initializations failed")
-
-        self.model = best_gmm
+        # Convert tensor to numpy if needed
+        if torch.is_tensor(X):
+            X_np = X.detach().cpu().numpy()
+        else:
+            X_np = X
+            
+        # Create and fit sklearn GMM
+        self.model = self.GMM(
+            n_components=self.n_components,
+            covariance_type=self.covariance_type,
+            tol=self.eps,
+            reg_covar=self.eps,
+            max_iter=self.max_iter,
+            n_init=3,  # Reduced from 10 to 3 for faster computation
+            init_params=self.init_params,
+            random_state=42  # Set seed for reproducibility
+        )
+        
+        self.model.fit(X_np)
+        self.log_likelihood = self.model.score(X_np)
         return self
 
     def predict_proba(self, X: Union[np.ndarray, torch.Tensor]) -> torch.Tensor:
         if self.model is None:
             raise RuntimeError("Call fit() first")
-        if not torch.is_tensor(X):
-            X = torch.from_numpy(X).float()
-        X = X.to(self.device)
-        return self.model.predict_proba(X)
+            
+        # Convert tensor to numpy if needed
+        if torch.is_tensor(X):
+            X_np = X.detach().cpu().numpy()
+        else:
+            X_np = X
+            
+        # Get probabilities from sklearn model and convert back to torch
+        probs_np = self.model.predict_proba(X_np)
+        return torch.tensor(probs_np, dtype=torch.float32).to(self.device)
 
     def predict(self, X: Union[np.ndarray, torch.Tensor]) -> torch.Tensor:
         if self.model is None:
             raise RuntimeError("Call fit() first")
-        if not torch.is_tensor(X):
-            X = torch.from_numpy(X).float()
-        X = X.to(self.device)
-        return self.model.predict(X)
+            
+        # Convert tensor to numpy if needed
+        if torch.is_tensor(X):
+            X_np = X.detach().cpu().numpy()
+        else:
+            X_np = X
+            
+        # Get predictions from sklearn model and convert back to torch
+        preds_np = self.model.predict(X_np)
+        return torch.tensor(preds_np, dtype=torch.long).to(self.device)
 
     def state_dict(self) -> Dict[str, Any]:
         if self.model is None:
             raise RuntimeError("Call fit() first")
+            
+        # Convert sklearn model parameters to torch tensors for saving
         return {
             'n_components': self.n_components,
-            'covariance_type': self.model.covariance_type,
-            'eps': self.model.eps,
-            'init_params': self.model.init_params,
-            'mu': self.model.mu.detach().cpu(),
-            'var': self.model.var.detach().cpu(),
-            'pi': self.model.pi.detach().cpu(),
+            'covariance_type': self.covariance_type,
+            'eps': self.eps,
+            'init_params': self.init_params,
+            'means': torch.tensor(self.model.means_, dtype=torch.float32),
+            'covariances': torch.tensor(self.model.covariances_, dtype=torch.float32),
+            'weights': torch.tensor(self.model.weights_, dtype=torch.float32),
+            'precisions_cholesky': torch.tensor(self.model.precisions_cholesky_, dtype=torch.float32) 
+                if hasattr(self.model, 'precisions_cholesky_') else None
         }
 
     def load_state_dict(self, state: Dict[str, Any]) -> "TorchGMM":
-        # Rebuild with same hyper-params and initial tensors
-        gmm = GaussianMixture(
+        # Import scikit-learn's GMM
+        from sklearn.mixture import GaussianMixture
+        
+        # Create a new model with the saved parameters
+        self.model = GaussianMixture(
             n_components=state['n_components'],
-            n_features=state['mu'].shape[2],
             covariance_type=state['covariance_type'],
-            eps=state['eps'],
-            init_params=state['init_params'],
-            mu_init=state['mu'].to(self.device),
-            var_init=state['var'].to(self.device),
-        ).to(self.device)
-        # Overwrite the mixing weights
-        gmm.pi.data = state['pi'].to(self.device)
-        gmm.params_fitted = True
-        self.model = gmm
+            tol=state['eps'],
+            reg_covar=state['eps'],
+            max_iter=self.max_iter,
+            n_init=self.n_init,
+            init_params=state['init_params']
+        )
+        
+        # Set the model parameters from the state dict
+        self.model.means_ = state['means'].cpu().numpy()
+        self.model.covariances_ = state['covariances'].cpu().numpy()
+        self.model.weights_ = state['weights'].cpu().numpy()
+        
+        if state['precisions_cholesky'] is not None:
+            self.model.precisions_cholesky_ = state['precisions_cholesky'].cpu().numpy()
+            
+        # Mark the model as fitted
+        self.model.n_features_in_ = self.model.means_.shape[1]
+        self.model.converged_ = True
+        
         return self
 
     @property
@@ -152,29 +172,29 @@ class TorchGMM:
         """Get cluster means."""
         if self.model is None:
             raise RuntimeError("Call fit() first")
-        return self.model.mu.squeeze(0)  # Remove batch dimension
+        return torch.tensor(self.model.means_, dtype=torch.float32).to(self.device)
 
     @property
     def covariances_(self):
         """Get cluster covariances."""
         if self.model is None:
             raise RuntimeError("Call fit() first")
-        return self.model.var.squeeze(0)  # Remove batch dimension
+        return torch.tensor(self.model.covariances_, dtype=torch.float32).to(self.device)
 
     @property
     def weights_(self):
         """Get cluster weights."""
         if self.model is None:
             raise RuntimeError("Call fit() first")
-        return self.model.pi.squeeze(0).squeeze(-1)  # Remove batch and trailing dimensions
+        return torch.tensor(self.model.weights_, dtype=torch.float32).to(self.device)
 
     @property
     def precisions_cholesky_(self):
         """Get cluster precision Cholesky factors."""
         if self.model is None:
             raise RuntimeError("Call fit() first")
-        # This is not directly available in gmm-torch
-        # We could compute it if needed, but for now just return None
+        if hasattr(self.model, 'precisions_cholesky_'):
+            return torch.tensor(self.model.precisions_cholesky_, dtype=torch.float32).to(self.device)
         return None
 
 def _compute_precision_cholesky(covariances, covariance_type):
@@ -749,7 +769,7 @@ def compute_and_cache_clusters(data, num_clusters, method='kmeans', random_state
         clusterer = KMeans(
             n_clusters=num_clusters,
             random_state=random_state,
-            n_init=10,
+            n_init=3,  # Reduced from 10 to 3 for faster computation
             max_iter=300
         )
         clusterer.fit(data_np)
@@ -761,7 +781,7 @@ def compute_and_cache_clusters(data, num_clusters, method='kmeans', random_state
         clusterer = GaussianMixture(
             n_components=num_clusters,
             n_features=data.shape[1],
-            covariance_type='full',
+            covariance_type='diag',  # Ensure using 'diag'
             eps=1e-6,
             init_params='kmeans'
         ).to(device)
@@ -1022,48 +1042,61 @@ def precompute_and_cache_features(data_module, domain_modules, device, batch_siz
 
 def compute_sweep_clusters(precomputed_data, sweep_id, num_clusters=10, cluster_method='kmeans', cluster_seed=42, normalize_inputs=False):
     """Compute clusters once at the start of a sweep and save them for all splits."""
-    # Create cache path with consistent naming
+    # Print GW representation dimensions
+    train_gw = precomputed_data['train']['gw_rep']
+    print("\n📊 GW Representation Info:")
+    print(f"├─ Shape: {train_gw.shape}")
+    print(f"├─ Type: {train_gw.dtype}")
+    if isinstance(train_gw, torch.Tensor):
+        print(f"└─ Device: {train_gw.device}")
+    
+    # Flatten any extra axes so it's strictly (N, D)
+    train_gw = train_gw.reshape(train_gw.shape[0], -1)
+    print(f"└─ Reshaped to: {train_gw.shape}")
+    
+    # Create cache path with consistent naming that includes num_clusters
     data_hash = hashlib.sha256(precomputed_data['train']['gw_rep'].cpu().numpy().tobytes()).hexdigest()[:8]
     clusters_path = os.path.join(
         'cluster_cache',
-        f'sweep_clusters_{sweep_id}_{cluster_method}_{num_clusters}_{cluster_seed}_{normalize_inputs}_{data_hash}.pt'
+        f'sweep_clusters_{sweep_id}_{cluster_method}_n{num_clusters}_{cluster_seed}_{normalize_inputs}_{data_hash}.pt'
     )
     
     # Check if clusters already exist for this sweep with these exact parameters
     if os.path.exists(clusters_path):
-        print(f"\nLoading pre-computed sweep clusters from: {clusters_path}")
+        print(f"\n🔄 Loading pre-computed sweep clusters from:")
+        print(f"   {clusters_path}")
         try:
             cluster_data = load_cluster_data(clusters_path)
-            print(f"[DEBUG] Loaded cluster_data keys: {list(cluster_data.keys())}")
+            print(f"✅ Successfully loaded cluster data with keys: {list(cluster_data.keys())}")
             
             # Create appropriate clusterer based on method
             if cluster_method == 'kmeans':
                 clusterer = CustomKMeans(cluster_data['centers'])
             else:  # GMM
-                print("[DEBUG] Creating TorchGMM from saved parameters")
+                print("\n🔧 Creating TorchGMM from saved parameters...")
                 clusterer = TorchGMM(
                     n_components=num_clusters,
-                    n_init=10,
+                    n_init=3,  # Reduced from 10 to 3 for faster computation
                     max_iter=300,
-                    covariance_type='full',
+                    covariance_type='diag',  # Changed to 'diag'
                     eps=1e-6,
                     init_params='kmeans'
                 )
                 clusterer.load_state_dict(cluster_data['gmm_state'])
-                print("[DEBUG] Successfully created TorchGMM clusterer")
+                print("✅ Successfully created TorchGMM clusterer")
             
             # Get train labels and probs
             train_labels = cluster_data.get('train_labels')
             train_probs = cluster_data.get('train_probs')
             
-            print(f"[DEBUG] After loading, train_labels is None: {train_labels is None}")
-            print(f"[DEBUG] After loading, train_probs is None: {train_probs is None}")
-            
             if train_labels is None or (cluster_method == 'gmm' and train_probs is None):
-                print("Labels or probabilities not found in saved cluster data, regenerating...")
+                print("\n⚠️  Labels or probabilities missing, regenerating...")
                 # Get training data
                 train_data = precomputed_data['train']
                 train_gw = train_data['gw_rep']
+                
+                # Flatten any extra axes so it's strictly (N, D)
+                train_gw = train_gw.reshape(train_gw.shape[0], -1)
                 
                 # Apply normalization if needed
                 if normalize_inputs and 'normalization_params' in cluster_data:
@@ -1083,61 +1116,64 @@ def compute_sweep_clusters(precomputed_data, sweep_id, num_clusters=10, cluster_
                 if train_probs is not None:
                     cluster_data['train_probs'] = train_probs
                     
-                # Debug info about the data we're saving
-                print(f"[DEBUG] Generated new train_labels shape: {train_labels.shape}, type: {type(train_labels)}")
-                if train_probs is not None:
-                    print(f"[DEBUG] Generated new train_probs shape: {train_probs.shape}, type: {type(train_probs)}")
-                    
                 # Save updated data
                 save_cluster_data(cluster_data, clusters_path)
-                print(f"Updated clusters saved to: {clusters_path}")
+                print("✅ Updated cluster data saved successfully")
             
             # Final check to confirm we have valid data to return
             if train_labels is None:
-                raise ValueError("Critical error: train_labels is still None after regeneration attempts")
+                raise ValueError("❌ Critical error: train_labels is still None after regeneration attempts")
             
             if cluster_method == 'gmm' and train_probs is None:
-                raise ValueError("Critical error: train_probs is still None for GMM after regeneration attempts")
+                raise ValueError("❌ Critical error: train_probs is still None for GMM after regeneration attempts")
             
             return clusterer, train_labels, train_probs, cluster_data.get('normalization_params')
             
         except Exception as e:
-            print(f"[DEBUG] Error loading cluster cache: {e}")
+            print(f"\n❌ Error loading cluster cache: {e}")
             # If loading fails for any reason, remove the corrupted cache and recompute
             os.remove(clusters_path)
-            print(f"Removed corrupted cluster cache, will recompute")
+            print(f"🗑️  Removed corrupted cluster cache, will recompute")
     
-    print(f"\nComputing clusters for sweep {sweep_id} (this will be done only once)...")
+    print(f"\n🔄 Computing clusters for sweep {sweep_id}")
+    print(f"├─ Method: {cluster_method}")
+    print(f"├─ Number of clusters: {num_clusters}")
+    print(f"└─ This will be done only once...")
     
     # Get training data
     if 'train' not in precomputed_data:
-        raise ValueError("Training split required for computing clusters")
+        raise ValueError("❌ Training split required for computing clusters")
     
     train_data = precomputed_data['train']
     if 'gw_rep' not in train_data:
-        raise ValueError("GW representation required for clustering")
+        raise ValueError("❌ GW representation required for clustering")
     
     train_gw = train_data['gw_rep']
+    
+    # Flatten any extra axes so it's strictly (N, D)
+    train_gw = train_gw.reshape(train_gw.shape[0], -1)
     
     # Initialize normalization if needed
     normalization_params = None
     if normalize_inputs:
+        print("\n📊 Normalizing input features...")
         mean = train_gw.mean(dim=0)
-        std = train_gw.std(dim=0, unbiased=False)  # Use unbiased=False to match sklearn's behavior
+        std = train_gw.std(dim=0, unbiased=False)
         normalization_params = {
             'mean': mean,
             'scale': std
         }
-        # Apply normalization
         train_gw = (train_gw - mean) / std
+        print("✅ Normalization complete")
     
     # Compute clusters based on method
     if cluster_method == 'kmeans':
         from sklearn.cluster import KMeans
+        print("\n🔄 Running K-means clustering...")
         kmeans = KMeans(
             n_clusters=num_clusters,
             random_state=cluster_seed,
-            n_init=10,
+            n_init=3,  # Reduced from 10 to 3 for faster computation
             max_iter=300
         )
         kmeans.fit(train_gw.cpu().numpy())
@@ -1151,26 +1187,25 @@ def compute_sweep_clusters(precomputed_data, sweep_id, num_clusters=10, cluster_
         }
         train_probs = None
         train_labels = cluster_data['train_labels']
+        print("✅ K-means clustering complete")
         
     else:  # GMM
-        print("[DEBUG] Using TorchGMM for clustering")
+        print("\n🔄 Running GMM clustering...")
         # Create and fit TorchGMM
         clusterer = TorchGMM(
             n_components=num_clusters,
-            n_init=10,
+            n_init=3,  # Reduced from 10 to 3 for faster computation
             max_iter=300,
-            covariance_type='full',
+            covariance_type='diag',  # Changed to 'diag'
             eps=1e-6,
             init_params='kmeans'
         ).fit(train_gw)
         
         try:
-            print("[DEBUG] Computing probabilities and predictions...")
+            print("├─ Computing probabilities...")
             # Get probabilities and predictions
             train_probs = clusterer.predict_proba(train_gw)
             train_labels = train_probs.argmax(dim=1)
-            
-            print("[DEBUG] Successfully computed probabilities and predictions")
             
             # Save all necessary GMM attributes
             cluster_data = {
@@ -1180,23 +1215,27 @@ def compute_sweep_clusters(precomputed_data, sweep_id, num_clusters=10, cluster_
                 'normalization_params': normalization_params
             }
             
-            print("[DEBUG] TorchGMM clustering completed successfully")
+            print("✅ GMM clustering complete")
             
         except Exception as e:
-            print(f"[DEBUG] Error during TorchGMM: {e}")
+            print(f"\n❌ Error during GMM clustering: {e}")
             traceback.print_exc()
             raise
     
     # Final safety check to ensure we have valid data to return
     if train_labels is None:
-        raise ValueError("Critical error: train_labels is None after clustering")
+        raise ValueError("❌ Critical error: train_labels is None after clustering")
     
     if cluster_method == 'gmm' and train_probs is None:
-        raise ValueError("Critical error: train_probs is None for GMM after clustering")
+        raise ValueError("❌ Critical error: train_probs is None for GMM after clustering")
+    
+    # Create cache directory if it doesn't exist
+    os.makedirs(os.path.dirname(clusters_path), exist_ok=True)
     
     # Save cluster data
     save_cluster_data(cluster_data, clusters_path)
-    print(f"Saved sweep clusters to: {clusters_path}")
+    print(f"\n💾 Saved cluster data to:")
+    print(f"   {clusters_path}")
     
     return clusterer, train_labels, train_probs, normalization_params
 
@@ -1444,7 +1483,7 @@ def create_synthetic_labels(data, num_clusters=10, method='kmeans', random_state
             clusterer = KMeans(
                 n_clusters=num_clusters,
                 random_state=random_state,
-                n_init=10,
+                n_init=3,  # Reduced from 10 to 3 for faster computation
                 max_iter=300
             )
             # Fit and predict
@@ -1458,9 +1497,9 @@ def create_synthetic_labels(data, num_clusters=10, method='kmeans', random_state
             # Create and fit GMM using our wrapper
             clusterer = TorchGMM(
                 n_components=num_clusters,
-                n_init=10,
+                n_init=3,  # Reduced from 10 to 3 for faster computation
                 max_iter=300,
-                covariance_type='full',
+                covariance_type='diag',  # Ensure using 'diag'
                 eps=1e-6,
                 init_params='kmeans'
             ).fit(data)
@@ -2204,14 +2243,28 @@ def train():
             "load_upfront": global_args.load_upfront  # Add load_upfront to config
         }, allow_val_change=True)
         
+        # Set up GPU memory management for vGPU environment
+        if torch.cuda.is_available():
+            # Limit memory growth
+            torch.cuda.set_per_process_memory_fraction(0.7)  # Use only 70% of available memory
+            # Empty cache before starting
+            torch.cuda.empty_cache()
+            print(f"Running on GPU: {torch.cuda.get_device_name()}")
+            print(f"Memory allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
+            print(f"Memory cached: {torch.cuda.memory_reserved() / 1024**2:.2f} MB")
+
         # Set random seed for reproducibility
         torch.manual_seed(config.random_seed)
         np.random.seed(config.random_seed)
         if torch.cuda.is_available():
-            torch.cuda.manual_seed(config.random_seed)
-            torch.cuda.manual_seed_all(config.random_seed)
-            torch.backends.cudnn.deterministic = True
-            torch.backends.cudnn.benchmark = False
+            try:
+                torch.cuda.manual_seed(config.random_seed)
+                torch.cuda.manual_seed_all(config.random_seed)
+                torch.backends.cudnn.deterministic = True
+                torch.backends.cudnn.benchmark = False
+            except Exception as e:
+                print(f"Warning: CUDA random seed initialization failed: {e}")
+                print("Continuing with only CPU random seed")
         
         # Set device
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
