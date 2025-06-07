@@ -1,0 +1,6 @@
+{
+  "domain_type": "v_latents",
+  "checkpoint_path": "/home/janerik/shimmer-ssd/checkpoints/domain_v.ckpt",
+  "name": "v_latents",
+  "args": {}
+} 

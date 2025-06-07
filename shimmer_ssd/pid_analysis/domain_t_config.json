@@ -1,0 +1,6 @@
+{
+  "domain_type": "t",
+  "checkpoint_path": "/home/janerik/shimmer-ssd/checkpoints/domain_t.ckpt",
+  "name": "t",
+  "args": {}
+} 
